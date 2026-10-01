@@ -1,0 +1,14 @@
+# 依赖
+node_modules/
+
+# 运行时数据：中转服务的落盘目录、冒烟测试的临时目录
+data/
+
+# 本地配置与密钥
+.env
+*.log
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,16 @@
+# 这个仓库在 Windows 上编辑、在 Linux 容器里构建，换行必须统一。
+# 不统一的话 Dockerfile 可能被 checkout 成 CRLF，`RUN npm ci` 那行会带上 \r，
+# 在容器里就变成"命令不存在"这类莫名其妙的报错。
+* text=auto eol=lf
+
+# Windows 脚本必须保持 CRLF，否则 cmd 跑不了
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary

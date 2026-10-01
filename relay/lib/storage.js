@@ -101,6 +101,43 @@ class Storage {
         return files;
     }
 
+    /**
+     * 列出某命名空间下的一级目录，也就是"桶"。
+     *
+     * 桶是隐式的：磁盘上没有"创建桶"这个动作，第一次写入时目录才被 mkdir 出来，
+     * 所以没有任何地方记着创建时间。目录自身的 mtime 也不能用——往里加一层子目录
+     * 就会把它刷新。唯一稳的时间锚点是**桶内最早那个文件的 mtime**，拿它当"新增时间"；
+     * 桶被清空时没有文件可依据，老老实实返回 null，别编一个。
+     */
+    async listBuckets(parts) {
+        const base = this.pathFor(parts);
+        let entries;
+        try {
+            entries = await fsp.readdir(base, { withFileTypes: true });
+        } catch (err) {
+            if (err.code === 'ENOENT') return [];   // 命名空间还没有任何数据，不是错误
+            throw err;
+        }
+
+        const buckets = [];
+        for (const entry of entries) {
+            // 命名空间目录下只该有桶。真有 stray 文件掉进来（比如误放的 auth.json），
+            // 跳过而不是把它当成一个桶列出来。
+            if (!entry.isDirectory()) continue;
+            const files = await this.list([...parts, entry.name]);
+            const times = files.map((file) => file.mtime).filter((t) => Number.isFinite(t));
+            buckets.push({
+                bucket: entry.name,
+                count: files.length,
+                usage: files.reduce((sum, file) => sum + file.size, 0),
+                createdAt: times.length ? Math.min(...times) : null,
+                lastModified: times.length ? Math.max(...times) : null,
+            });
+        }
+        buckets.sort((a, b) => a.bucket.localeCompare(b.bucket));
+        return buckets;
+    }
+
     async remove(parts) {
         const target = await this.stat(parts);
         if (!target) return false;

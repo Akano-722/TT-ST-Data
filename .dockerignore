@@ -1,0 +1,18 @@
+# 本机装的依赖绝不能进镜像。
+# Windows/macOS 上装的 node_modules 覆盖进 Alpine 镜像后，原生模块会直接跑不起来；
+# 而且它会在 `RUN npm ci` 之后被 `COPY . .` 覆盖掉，等于白装。
+node_modules
+
+# 运行时数据与密钥，绝不进镜像（镜像里 DATA_DIR 指向的是挂载卷）
+data
+.env
+*.log
+
+# 版本控制与编辑器杂项
+.git
+.gitignore
+.dockerignore
+*.md
+
+# 测试只在本地跑，镜像里不需要
+test

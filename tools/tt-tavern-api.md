@@ -224,8 +224,8 @@ GET /api/extensions/data-migration/job?id=<job_id>
 | group chats | `/api/groups/all` 里每个组的 `.chats` 就是群聊 id 列表 + `/api/chats/group/get`（body `{id}` → 消息数组） | ✅ |
 | groups | `/api/groups/all` → 组对象数组，直接就是 `groups/<id>.json` 的内容 | ✅ |
 | worlds | 名字**只在** `/api/settings/get` 的 `world_names` 里（没有"列世界书"的接口）→ `/api/worldinfo/get`（body `{name}`） | ✅ |
-| backgrounds | `/api/backgrounds/all` → `{images:[路径]}`，**只有路径，没有字节** | ⚠️ 见下 |
-| avatars | `/api/avatars/get` → **名字数组**，也没有字节 | ⚠️ 见下 |
+| backgrounds | `/api/backgrounds/all` → `{images, config}`；`images` 的元素是 **`{filename, isAnimated}` 对象**（也可能直接是字符串，前端两种都认），**只有名字、没有字节** | ⚠️ 见下 |
+| avatars | `/api/avatars/get` → **名字数组**，也没有字节 | ✅ 真机可取到字节，见下 |
 | images | 只有 `/api/images/list`，**没有取字节的接口** | ❌ |
 | files | **完全没有读接口**（只有 upload/delete/verify/sanitize） | ❌ |
 | presets | 只有 save/delete/restore，**没有 list** | ❌ |
@@ -241,7 +241,24 @@ GET /api/extensions/data-migration/job?id=<job_id>
 - 前端渲染时用的是**相对路径**（背景是 `backgrounds/<file>`；用户头像是 `getThumbnailUrl('persona', name)`，定义在 `src/script.js:9136` —— TT 上走注入的 `window.__TAURITAVERN_THUMBNAIL__`，我们拿不到）。
 - 实现里是**尽力而为**：照 `backgrounds/<encodeURI(path)>`、`User Avatars/<encodeURIComponent(name)>` 各取一次，并且**只认 `Content-Type: image/*`** —— 取不到时多半会落到前端页面（200 + `text/html`），那种一律当没有、记进日志，绝不往包里塞 HTML。
 - 自定义外链背景（`http(s)://`）跳过 —— 那不是本机数据。
-- **这一步没在真机上验证过**（没有设备），属于"尽力而为"里最不确定的一块；真机日志里看 `背景图：N 张里只取到 M 张`。
+
+### 🐞 真机首跑（2026-10-01 22:57，`EXT_VERSION = 2026-10-01.3`）
+
+**成的：**
+- 逐类读整条链路通了 —— 世界书 **22/22 本**全部读到（每本 ~8ms）、用户头像 **25 张全部 200 且读到了字节**（`User Avatars/<名字>` 这条路是对的，TT 确实按这个相对路径提供字节）。
+- 最后**拼出 123 个条目、141.28 MB** 的 zip 并发起了 PUT。
+
+**没成的：**
+- **背景图 28 张一张都没取到**，而且 URL 长这样：`backgrounds/%5Bobject%20Object%5D` → HTTP 404。
+  原因是 `/api/backgrounds/all` 的 `images[]` 里是**对象**（`{filename, isAnimated}`），代码里 `String(raw)` 把它变成了 `"[object Object]"`。
+  修法：取 `entry.filename`（源出处 `src/scripts/backgrounds.js:119` 的 `normalizeSystemBackgroundEntry`：字符串直接用，对象取 `.filename`）。
+  真实 URL 形式是 `backgrounds/<filename>`，**不编码**（`getBackgroundPath()`，`backgrounds.js:377-380`；编码版那个是缩略图用的）。
+  **好消息**：那个 404 说明 `backgrounds/*` 是**被真正路由的**（不是落到前端页面回 200 + text/html），所以名字修对之后大概率能取到 —— 但还是要在真机上确认。
+
+**两个待观察：**
+- **141 MB 的包可能把中转 PUT 撑爆超时**：`relayPut` 挂的是 `TIMEOUT_MS.relay = 60s`，而手机上行传 141 MB 很可能超过 60 秒 → 会被客户端自己 abort 掉。日志最后一行停在 `中转 PUT … 发出`，**结果未知**（用户截断了）。先看 relay 后台有没有收到那条 PUT、以及面板有没有报"中转 PUT 超时"。
+  若确实是超时：上传要单独给一个大得多的超时（或改成"按字节进度算超时"），不能和普通的 `GET /v1/meta` 共用一个 60s。
+- 141 MB 也不小 —— 恢复侧要几百个请求，云侧"从中转恢复"的耗时要实测。
 
 ### 拼 zip 的关键约束（从云侧 restore 反推，别踩）
 

@@ -35,7 +35,7 @@ curl -s "https://api.github.com/repos/Darkatse/TauriTavern/contents/<路径>?ref
   - `Content-Disposition: attachment; filename="<encodeURI 后的文件名>"`
   - body 是 `PK\x03\x04` 开头的 zip。
 - 内部流程：`read_secret_settings`（读 `allowKeysExposure` → `include_secrets`）→ `export_user_backup_archive { handle, include_secrets }` → `createReadableFileStream` 流回 → 流完 `cleanup_user_backup_archive`。
-- **没有 `/api/users/me`**（grep 过 `user-routes.js`，只有 `/api/users/backup`）。所以我们 `currentHandle()` 里 `GET /api/users/me` 会 404，落到 fallback `'default-user'` —— 正好和 TT 默认 handle 对得上，无副作用。
+- **`user-routes.js` 里没有 `/api/users/me`**（这个文件只有 `/api/users/backup` 一条路由）。所以本以为是 404，但 **2026-10-01 真机实测：`GET /api/users/me` 回的是 `HTTP 200`，只是 body 读不出来**（WebKit 抛 `SyntaxError: The string did not match the expected pattern.`）。像是被别的处理器/兜底路由接走了。`currentHandle()` 因此落到 fallback `'default-user'` —— 正好和 TT 默认 handle 对得上，无副作用，但"会 404"这个说法是错的，别照抄。
 
 ## 2. 内置「数据迁移」扩展（Data Migration）—— 整包导入/导出
 
@@ -106,8 +106,32 @@ GET /api/extensions/data-migration/job?id=<job_id>
 1. **导出不回 JS 字节**。data-migration 的导出全走原生（SAF / 分享面板 / 桌面对话框），没有一条路由把 zip 字节流回 WebView。全仓库唯一把用户备份 zip 流回 JS 的就是 `POST /api/users/backup`。
    ⇒ **上传侧只能继续用 `POST /api/users/backup` 流式**，没别的路拿到字节去 PUT 到 relay。
 2. **恢复侧可以整包导入**。手机（TT）拉对面备份时，用 `POST /api/extensions/data-migration/import`（FormData `archive`）一条搞定，不用再拆开按 14 类写回。
-3. **卡死根因假设**（仍未在真机上坐实）：TT 移动端 WebView 消费 `POST /api/users/backup` 那个带 `Content-Disposition: attachment` 的大二进制流时，fetch 的 promise 可能永远不 settle。我们扩展里所有 fetch 都没有超时，于是 `STATE.busy` 永远 `true`、状态栏永远"正在同步"、后续点击全被"正在忙"挡住。
-   这个"头回来了、body 不结束"的**形态**已经能在本机服务器上复现（§5 的 `hang-body` 用例），超时也确实能兜住它；但"TT 手机端真就是这么卡的"还需要拿真机的 `[ST-Sync]` 日志（"响应头到达"之后没有"body 读完"）来确认。
+3. **手机上传失败的真正根因（2026-10-01 真机坐实，推翻了之前的"WebView 卡死不 settle"假设）**：
+   手机（iOS TT）上 `POST /api/users/backup` **响应头正常 200 回来，但读 body 时抛 `forbidden path`**，指向的就是 TT 自己刚打包出来的那个 zip：
+
+   ```
+   酒馆生成备份 响应头到达：HTTP 200，用时 2671ms
+   酒馆生成备份 读 body 失败 forbidden path:
+     /private/var/mobile/Containers/Data/Application/<uuid>/Library/Caches/
+     com.tauritavern.client/tauritavern-export-staging/user-backups/
+     .user-backup-<hex>-default-user-<stamp>.zip
+   ```
+
+   链路（每一环都在源码里核过）：
+   - 路由 `src/tauri/main/routes/user-routes.js`：`export_user_backup_archive` 打包 → `createUserBackupArchiveStream` → `context.createReadableFileStream(archivePath)` → 立刻 `return new Response(stream, ...)`。**头是路由发的，body 才去读文件**，所以故障一定出现在"头回来之后"。
+   - `src/tauri/main/services/files/readable-file-stream-service.js`：`createReadableFileStream` 内部调 Tauri 的 **`plugin:fs|open`**。scope 校验不通过 → `forbidden path: <路径>`（tauri-plugin-fs 的 `ForbiddenPath` 文案）。
+   - 注意 `plugin:fs|open` 的 promise 是在 `ReadableStream.pull()` 里才 await 的 → 被拒时 Response 头早已发出，表现就是"头 200、body 炸"。
+
+   **为什么 scope 会拒**：`src-tauri/crates/tauritavern/capabilities/default.json` 里，给 appcache 的只有 `fs:allow-appcache-write-recursive`（**写**）；读靠 `fs:default`。而 tauri-plugin-fs 的 `fs:default` = `create-app-specific-dirs` + `read-app-specific-dirs-recursive` + `deny-default`，描述里明说覆盖 AppConfig/AppData/AppLocalData/**AppCache**/AppLog —— 也就是说**这里本该放行，实际却被拒**。属于 TT 自己的失误，不是我们 scope 没配。
+     （注：该 capability 里显式列出的两条 `fs:scope` 是 Android 路径；iOS 的读全靠 `fs:default`。）
+
+   **对我们代码的影响**：Tauri v2 的 `invoke` 用一个**裸字符串** rejected，一路穿到我们的 `res.blob()`。于是 `err.message === undefined` → `notify('error', undefined)` → **弹一个空白 toast**（这就是用户早期看到的"空白弹窗"）。面板日志里能看到原文（`logArg` 对字符串原样输出），但 toast 是空的。
+   ⇒ **未修**：理论上可以在 push 出错时把非 Error 的抛出物包成 Error，好让 toast 有内容。真正的问题是路径/scope，我们改不了。
+
+   **同一家族的 TT 已知 bug**：[issue #193](https://github.com/Darkatse/TauriTavern/issues/193)（2026-08-19 报，08-24 关）——`/api/backups/chat/download` 的读取被错误路由进 `.staging/chat-commits` 物化流程，同样报 `forbidden path`。维护者回复原文：「确实是我们这边的一个失误，已经改成了更简单的形式读取，直接解压思路，不再需要 `.staging` 了」，并让报告者跟 iOS TestFlight 内测版。**但那修的是 chat 备份那条路由，不是 `users/backup` 这条**；搜遍 issue 也只有 #193 提过 `forbidden`，**我们这条路径（`Caches/.../tauritavern-export-staging`）截至 2026-10-01 没人报过**。
+   - 相关源码变动：`readable-file-stream-service.js` 在 2026-09-13 改过两次（`5ca99a87a` 按文件大小限流、`44d3a04df`），都进了 2026-09-19 的 **v2.3.0**；而 `user-routes.js` 自 2026-05-17 起没动过。
+
+   **下一步（未定）**：先确认用户的 TT 版本、升到 v2.3.0 或更新的 TestFlight 再试；仍失败就把上面这份日志原样提给 TT 仓库。**别再往"超时值不够"或"WebView 卡死"方向查了**——都不是。
 
 ## 4. 已实现（对应 extension/st-sync/index.js）
 
@@ -143,26 +167,40 @@ GET /api/extensions/data-migration/job?id=<job_id>
 - **原生整包导入到底怎么合并**：TT 那个后端只说了"import and migrate"，是覆盖、合并还是清空重来，源码里没读出结论。所以恢复前的确认框只敢说"交给酒馆原生导入"，不敢做"不会删本机多出来的东西"这种承诺。
 - **超时值是否够**：60s / 180s 是拍的，没有真实设备上的耗时数据。真机跑一次看 `[ST-Sync]` 那几行"用时 XXXXms"再定。
 
-## 7. 当前交接状态（2026-10-01）
+## 7. 交接状态（2026-10-01 当天就走完了）
 
-用户的原始症状：**手机上点「上传到中转」，relay 日志里一条记录都没有；更新扩展后也没看到任何超时提示。**
+**结果：诊断一轮就查出根因，且根因不在我们这边 —— 是 TT 自己的 `forbidden path`（见 §3.3）。**
 
-「relay 日志没有记录」说明请求根本没走到 relay —— 卡点在它之前（最可能是 `buildLocalBackup` 那条 `POST /api/users/backup`，也就是 §3.3 那个假设）。但**光靠 console 已经查不动了**，所以这一轮全是加诊断（§4.4），目的不是修 bug，而是**让手机自己能说话**。
+时间线：
 
-**代码已改完并提交推送，测试已实跑通过（42/0）。现在卡在等真机复现。**
+1. 原始症状：手机上点「上传到中转」，relay 日志一条记录都没有，也没有任何超时提示。
+2. 加诊断（§4.4）后观察到：**手机上面板只显示"测试连接"的两条记录（`GET /v1/meta`、`GET /v1/ns/A/tavern`），上传那条请求压根没到 relay。**测试连接是通的 ⇒ 网络、令牌、命名空间都没问题，卡点在上传路径本身。
+3. 中间卡了一下：手机上**面板底部既没有日志框也没有版本号** ⇒ 扩展没更上。原因是点完「更新」**必须重新加载页面/重开 App**（TT 前端更新成功的 toast 原文就是 "Reload the page to apply updates"），只切后台不够。
+4. 更上之后一次复现就拿到决定性日志（`EXT_VERSION = 2026-10-01.2`）：
 
-下一步：
+   ```
+   21:41:50 [info] 正在打包并上传…
+   21:41:50 取当前用户 发出（超时 60s）：/api/users/me
+   21:41:50 取当前用户 响应头到达：HTTP 200，用时 10ms
+   21:41:50 取当前用户 读 body 失败 SyntaxError: The string did not match the expected pattern.
+   21:41:50 取当前用户失败，退回 default-user SyntaxError: The string did not match the expected pattern.
+   21:41:50 酒馆生成备份 发出（超时 180s）：/api/users/backup
+   21:41:53 酒馆生成备份 响应头到达：HTTP 200，用时 2671ms
+   21:41:53 酒馆生成备份 读 body 失败 forbidden path: /private/var/mobile/.../tauritavern-export-staging/user-backups/.user-backup-<hex>-default-user-<stamp>.zip
+   21:41:53 同步出错 forbidden path: ...
+   21:41:53 [error] undefined
+   ```
 
-1. ~~`node tools/sync-restore-test/run.js`~~ 已过。
-2. ~~提交 + `git subtree split` + `git push origin main extension`~~ 已推。
-3. 让用户在手机酒馆里**更新扩展并硬刷新**，然后问三个问题（答案决定下一步往哪查）：
+   顺带两条副产品观察：
+   - **`GET /api/users/me` 不是 404**，而是 **200 但 body 读不出来**（WebKit 报 `SyntaxError: The string did not match the expected pattern.`，注意那不是 `JSON.parse` 的错——`readJsonSafe` 已经把 JSON 错吞了，说明是 `res.text()` 自己抛的）。反正落到 fallback `default-user`，和 TT 默认值一致，无副作用；但 §1 那条"没有 `/api/users/me`，会 404"**在用户的 TT 版本上不成立**，记一笔。
+   - 那句 `[error] undefined` 就是早期用户看到的"空白弹窗"的成因：rejected 的是裸字符串，`err.message` 是 undefined。
 
-   | 问题 | 看哪里 | "否"意味着 |
-   |---|---|---|
-   | 面板底部版本号变了没？ | `st_sync_version` | 扩展压根没更上，先解决更新，别查同步 |
-   | 点上传后状态栏秒数在跳吗？ | `⏳ … 已 N 秒` | 不跳 = 处理函数没进（多半确认框在屏幕外），跳 = 扩展活着、卡在某一步 |
-   | 日志里有没有 `点击「上传到中转」`？ | 面板底部日志框 | 没有 = 点击没进处理函数；有 = 再看它后面停在哪一行 |
+**下一步（还没做）：**
 
-   **日志停在哪一行，就把 §3.3 那个假设坐实或推翻**：停在"发出"= 请求发不出去；停在"响应头到达"没有"body 读完" = 假设成立（真凶确认，去调超时值/换上传路径）；三行都有 = 假设不成立，得换方向查。
+1. **确认用户的 TT 版本**，升到 v2.3.0（2026-09-19 发布，含 09-13 的流读取改动）或更新的 TestFlight 内测版，再试一次上传。
+2. 若仍失败：把上面那段日志原样提给 `Darkatse/TauriTavern`（**目前全仓库 issue 里只有 #193 提过 `forbidden`，我们这条路径没人报过**，见 §3.3）。
+3. 可选的小改进：push 出错时把非 Error 的抛出物包成 Error，好让 toast 不再是空白（现在信息只在面板日志里）。
+
+**不用再查的方向**：超时值不够（不是）、WebView 消费流不 settle（不是）。§5 里 `hang-body` 那个用例复现的是另一种形态，与本 bug 无关。
 
 用户是在**手机上装扩展**测试的，那里没有任何控制台——**以后这个项目所有诊断都必须落在面板 UI 里**，`console.*` 只能当附带。

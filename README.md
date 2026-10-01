@@ -110,7 +110,21 @@ npm test                  # 26 项冒烟测试：接口、鉴权、命名空间�
 
 ### 3. 装扩展
 
-把 `extension/st-sync/` 整个文件夹放到两台酒馆的：
+**方式一：从 GitHub 装。** 酒馆的「扩展」面板 → **安装扩展**，填：
+
+| 字段 | 填什么 |
+|---|---|
+| URL | `https://github.com/Akano-722/TT-ST-Data` |
+| Branch or tag name | `extension` |
+
+⚠️ **分支那一栏必须填 `extension`。** 这是 monorepo，默认分支的根目录没有 `manifest.json`
+（扩展在 `extension/st-sync/` 子目录下），而酒馆是**在仓库根目录找 manifest** 的。
+填错或留空的话，酒馆会把整个 clone 删掉并报 500，界面上只显示"安装失败"。
+
+`extension` 分支是 `git subtree split` 从 `extension/st-sync/` 切出来的，根目录就是扩展本身。
+每次改完扩展要**重新切一次并推上去**（见下面「发布扩展更新」）。
+
+**方式二：手动拷贝。** 把 `extension/st-sync/` 整个文件夹放到两台酒馆的：
 
 ```
 <SillyTavern>/public/scripts/extensions/third-party/st-sync/
@@ -202,6 +216,34 @@ npm test                  # 26 项冒烟测试：接口、鉴权、命名空间�
   `tools/probe-backup-contents.md` 跑一次就能确认，别猜。
 - **中转服务上仍然存着你全部的酒馆数据**（聊天记录、角色卡、世界书、`settings.json`）。
   它不是你的服务器就没人管了——别把令牌泄漏出去，也别把这个服务开放给不信任的人。
+
+## 发布扩展更新
+
+扩展在 `extension/st-sync/` 下改完后，酒馆那边**不会自动看到**——要把它切到 `extension` 分支推上去：
+
+```bash
+# 1. 提交改动
+git add extension/st-sync
+git commit -m "扩展：xxx"
+
+# 2. 重新切分支（分支已存在，先删再切）
+git branch -D extension
+git subtree split --prefix=extension/st-sync -b extension
+
+# 3. 推上去（不要加 --force）
+git push origin extension
+```
+
+装好扩展的酒馆，在「扩展」面板里点它的**更新**按钮就能拉到新版本。
+
+> **`git subtree split` 是确定性的**：只要 `main` 的历史是只追加的，重新切出来的提交和上次
+> **前 n 个完全相同**，所以推上去是快进。如果你 rebase / amend 过 `main` 的已推历史，
+> 推 `extension` 就会变成非快进，需要 `--force`——而**已经装过扩展的酒馆再点更新会失败**
+> （两边历史分叉），只能删掉重装。所以定稿之后尽量别再改已推上去的历史。
+
+> 想发固定版本的话，给切出来的提交打个 tag：
+> `git tag v0.1.0 extension && git push origin v0.1.0`，
+> 安装时「Branch or tag name」填 tag 名即可——那个输入框**分支和 tag 都认**。
 
 ## 已知限制
 

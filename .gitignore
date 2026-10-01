@@ -4,6 +4,10 @@ node_modules/
 # 运行时数据：中转服务的落盘目录、冒烟测试的临时目录
 data/
 
+# zip 解包器的测试夹具：1.1MB 二进制，由 make_fixtures.py 确定性生成，不进仓库。
+# 跑测试前先执行：python tools/zip-reader-test/make_fixtures.py
+tools/zip-reader-test/fixtures/
+
 # 本地配置与密钥
 .env
 *.log

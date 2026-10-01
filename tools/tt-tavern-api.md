@@ -205,39 +205,57 @@ GET /api/extensions/data-migration/job?id=<job_id>
 
 用户是在**手机上装扩展**测试的，那里没有任何控制台——**以后这个项目所有诊断都必须落在面板 UI 里**，`console.*` 只能当附带。
 
-## 8. 上传侧绕行方案：逐类读 + 客户端拼 zip（进行中，2026-10-01 定）
+## 8. 上传侧绕行方案：逐类读 + 客户端拼 zip（**已实现**，2026-10-01）
 
 `/api/users/backup` 在 iOS 上走不通（§3.3），所以上传侧改用**酒馆自己的逐类读接口**把数据读回来、客户端拼一个 zip 再 PUT 到 relay。**云侧（原版 ST）的 `restoreFromZip` 一行不用改**，协议和中转里已有快照都保持兼容。
 
+代码：`extension/st-sync/index.js` —— `buildLocalBackup()` 按 `isTauriTavern()` 分叉，TT 走 `buildTtBackup()`（`collectTtEntries()` 逐类读 → `buildZip()` 拼包），原版 ST 仍走 `/api/users/backup`（那边后端打包又快又全，别动）。
+测试：`tools/sync-restore-test/run.js` —— 拼 zip 的圆进圆出 + **Python `zipfile` 换实现交叉验证** + TT 分叉桩测（`makeTtReadFetch`）。
+
 ### TT 的读接口（**全部是 POST**，和原版 ST 的 GET 不一样）
 
-出处 `src/tauri/main/routes/*.js`：
+出处 `src/tauri/main/routes/*.js`（2026-10-01 逐个复核过，源码怎么再拉见本节最后一小节）：
 
 | 类 | 读接口 | 状态 |
 |---|---|---|
-| settings | `POST /api/settings/get` | ✅ |
-| characters | `POST /api/characters/all`（列表）+ `POST /api/characters/export`（body `{avatar_url, format:'png'\|'json'}` → **原始字节** Response） | ✅ 可字节保真 |
-| chats | `POST /api/characters/chats`（列某角色的聊天）+ `POST /api/chats/get`（取消息） | ✅ |
-| group chats | `POST /api/chats/group/info` + `POST /api/chats/group/get` | ✅ |
-| groups | `POST /api/groups/all` + `POST /api/groups/get` | ✅ |
-| worlds | `POST /api/worldinfo/get` + `POST /api/worldinfo/get-batch` | ✅ |
-| backgrounds | `POST /api/backgrounds/all`（字节返回方式待确认） | ⚠️ |
-| avatars | `POST /api/avatars/get`（同上） | ⚠️ |
-| images | 只有 `POST /api/images/list`，**没有取字节的接口** | ❌ |
-| files | **完全没有读接口**（只有 upload/delete/verify） | ❌ |
+| settings | `/api/settings/get` → **整份 settings.json**，注意里面带 `world_names` | ✅ |
+| characters | `/api/characters/all`（列表，`.avatar` 是真实文件名）+ `/api/characters/export`（body `{avatar_url, format:'png'}` → **原始字节** Response） | ✅ 可字节保真 |
+| chats | `/api/characters/chats`（body `{avatar_url}` → `[{file_id, file_name}]`）+ `/api/chats/get`（body `{avatar_url, file_name}` → **消息对象数组**，不是 JSONL） | ✅ |
+| group chats | `/api/groups/all` 里每个组的 `.chats` 就是群聊 id 列表 + `/api/chats/group/get`（body `{id}` → 消息数组） | ✅ |
+| groups | `/api/groups/all` → 组对象数组，直接就是 `groups/<id>.json` 的内容 | ✅ |
+| worlds | 名字**只在** `/api/settings/get` 的 `world_names` 里（没有"列世界书"的接口）→ `/api/worldinfo/get`（body `{name}`） | ✅ |
+| backgrounds | `/api/backgrounds/all` → `{images:[路径]}`，**只有路径，没有字节** | ⚠️ 见下 |
+| avatars | `/api/avatars/get` → **名字数组**，也没有字节 | ⚠️ 见下 |
+| images | 只有 `/api/images/list`，**没有取字节的接口** | ❌ |
+| files | **完全没有读接口**（只有 upload/delete/verify/sanitize） | ❌ |
 | presets | 只有 save/delete/restore，**没有 list** | ❌ |
 | themes | 只有 save/delete | ❌ |
-| quick-replies | 只有 save/delete | ❌ |
-| movingUI | 没找到 | ❌ |
+| quick-replies | 只有 save/delete（外加 `/savequickreply` 老式路由） | ❌ |
+| movingUI | 没有 | ❌ |
 
-❌ 的那几类在 TT 上**读不出来**，v1 直接跳过并在面板日志里标注（用户已同意「尽力而为」）。
+❌ 的那几类在 TT 上**读不出来**，实现里直接跳过并在面板日志里点名（`TT_NO_READ_API`，用户已同意「尽力而为」）。
+
+### ⚠️ 背景图 / 用户头像：TT 没有"按路径读字节"的 HTTP 接口
+
+- `/api/backgrounds/all` 和 `/api/avatars/get` 都只给**名字**。图片本身在 TT 里是走 Tauri 的 **asset 协议**（`tauri-bridge.js` 的 `convertFileSrc(path,'asset')` / `getAssetUrl`）喂给 `<img>` 的，不是某个 HTTP 路由。
+- 前端渲染时用的是**相对路径**（背景是 `backgrounds/<file>`；用户头像是 `getThumbnailUrl('persona', name)`，定义在 `src/script.js:9136` —— TT 上走注入的 `window.__TAURITAVERN_THUMBNAIL__`，我们拿不到）。
+- 实现里是**尽力而为**：照 `backgrounds/<encodeURI(path)>`、`User Avatars/<encodeURIComponent(name)>` 各取一次，并且**只认 `Content-Type: image/*`** —— 取不到时多半会落到前端页面（200 + `text/html`），那种一律当没有、记进日志，绝不往包里塞 HTML。
+- 自定义外链背景（`http(s)://`）跳过 —— 那不是本机数据。
+- **这一步没在真机上验证过**（没有设备），属于"尽力而为"里最不确定的一块；真机日志里看 `背景图：N 张里只取到 M 张`。
 
 ### 拼 zip 的关键约束（从云侧 restore 反推，别踩）
 
 - 扁平布局（**没有** `user/data/default-user/` 前缀，根目录直接是 `characters/`、`settings.json`…），规格来源 = `classifyRestoreEntry` + `RESTORE_ORDER` + `PRESET_DIRECTORIES` + `RESTORE_SKIP_PREFIXES`。
-- 聊天必须是 **JSONL**（每行一个 message），云侧 `stParseJsonl` 读回。
-- **角色卡导出成 `.png`**，且 `characters/<card>.png` 与 `chats/<card>/` 的 `<card>` 必须一致 —— 云侧 `writeChat` 靠 `avatar_url` 反解角色名。用 `/api/characters/all` 给的 `avatar` 真名，别用显示名。
-- **secrets 跳过**，对齐 ST 默认的 exclude 行为。
-- 现有 `ZipReader` 只有读（inflate），**没有 zip writer** —— 需要新增一个 store-only（method 0）的写出口。
+- 聊天必须是 **JSONL**（每行一个 message），云侧 `stParseJsonl` 读回；而 TT 的 `/api/chats/get` 回的是**数组**，要自己逐条 `JSON.stringify` 拼行。
+- **角色卡导出成 `.png`**，且 `characters/<card>.png` 与 `chats/<card>/` 的 `<card>` 必须一致 —— 云侧 `writeChat` 靠 `avatar_url` 反解角色名。`<card>` = `/api/characters/all` 给的 `avatar` 去掉 `.png`（TT 侧 `characterStemFromAvatarFileName` 就是这个规则，`services/characters/character-identity.js`）。
+- 条目名里带路径分隔符的一律不收（`ttSafeName`）：否则条目会跑到别的目录，云侧按前缀分类就错了。
+- **secrets 跳过**：`/api/settings/get` 不含 secrets（secrets 另有 `/api/secrets/*`），天然对齐 ST 默认的 exclude 行为。
+- zip 是**自己拼的 store-only**（method 0）：`buildZip()` + `crc32()`，纯函数、零依赖。云侧 `ZipReader` 对 method 0 原样返回、不校验 CRC，但 CRC 仍按标准写对（Python `zipfile.testzip()` 校验通过、中文名按 UTF-8 正确还原）。
+- 整包在内存里拼（和云侧现状一致），大账号有风险；没做流式。
 
-**详细实施计划在 `C:\Users\sekiya\.claude\plans\declarative-spinning-kettle.md`**（换窗后从那里接，本文件只记结论）。
+### 怎么再查 TT 源码（本机网络限制的解法）
+
+- `raw.githubusercontent.com` 本机 DNS 被挡；`api.github.com` 能通但**每小时只有 60 次**（很容易撞 rate limit）；`github.com` 的 tarball 会重定向到 codeload，本机到 codeload 大约 25 KB/s —— 整仓（>50 MB）拉不完。
+- **能用的是 jsDelivr**：`curl -s "https://cdn.jsdelivr.net/gh/Darkatse/TauriTavern@main/<路径>"`，单文件秒回。
+- `data.jsdelivr.com` 的目录列表接口对这个仓报 403（"Package size exceeded the configured limit of 50 MB"），所以只能按已知路径逐个拉，猜路径比列目录快。
+

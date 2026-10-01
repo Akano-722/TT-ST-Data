@@ -22,6 +22,9 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const os = require('os');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const HERE = __dirname;
 const ROOT = path.resolve(HERE, '..', '..');
@@ -53,6 +56,8 @@ const EXPORTS = [
     'isTauriTavern', 'restoreModeHint', 'settings', 'STATE', 'TIMEOUT_MS', 'DM_API',
     'JOB_POLL_INTERVAL_MS', 'JOB_TIMEOUT_MS',
     'EXT_VERSION', 'log', 'LOG_LINES', 'LOG_MAX_LINES', 'logText', 'beginBusy', 'endBusy',
+    // 上传绕行：拼 zip + 逐类读
+    'buildZip', 'crc32', 'ZipReader', 'collectTtEntries', 'buildTtBackup', 'TT_API', 'TT_NO_READ_API',
 ];
 
 /**
@@ -622,6 +627,342 @@ async function testDetect(bad_) {
     }
 }
 
+/* ---------------------------------------------- 上传绕行：拼 zip + 逐类读 */
+
+/**
+ * 造一份"假 TT 酒馆"的读接口。
+ *
+ * 值为的一个是形状对得上，另一个是把边角料都塞进来：带路径分隔符的角色卡名、
+ * 读不出来的群聊、外部链接的背景图 —— 这些在生产上一定会遇到，出事了才知道该跳过。
+ */
+function makeTtReadFetch({ imageType = 'image/png' } = {}) {
+    const seen = [];
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+    const impl = async (url, opts) => {
+        const method = (opts && opts.method) || 'GET';
+        const body = opts && opts.body ? JSON.parse(opts.body) : {};
+        seen.push({ url: String(url), method, body });
+
+        // 上传侧的老路，TT 分叉里一次都不该出现
+        if (url.includes('/api/users/backup')) throw new Error('TT 分叉不该再去下载备份');
+
+        if (url.includes('/api/settings/get')) {
+            return json({ theme: 'dark', username: 'u', world_names: ['WorldA', 'Bad/Name'] });
+        }
+        if (url.includes('/api/characters/all')) {
+            return json([
+                { avatar: 'Alice.png', name: 'Alice' },
+                { avatar: 'Bad/Name.png', name: '名字里带斜杠' },   // 该被 ttSafeName 挡掉
+            ]);
+        }
+        if (url.includes('/api/characters/export')) {
+            if (body.avatar_url !== 'Alice.png') return json({ error: 'Character not found' }, 404);
+            return new Response(PNG, { headers: { 'Content-Type': 'image/png' } });
+        }
+        if (url.includes('/api/characters/chats')) {
+            return json([{ file_id: 'chat1', file_name: 'chat1.jsonl' }]);
+        }
+        if (url.includes('/api/chats/get')) {
+            return json([{ mes: '你好', is_user: true }, { mes: '在' }]);
+        }
+        if (url.includes('/api/groups/all')) {
+            return json([{ id: 'g1', name: '群一', chat_id: 'gc1', chats: ['gc1', 'gc2'] }]);
+        }
+        if (url.includes('/api/chats/group/get')) {
+            // gc2 故意读不出来：单个失败不能连累别的
+            if (body.id === 'gc2') return json({ error: 'Failed to load group chat' }, 500);
+            return json([{ mes: '群聊一句' }]);
+        }
+        if (url.includes('/api/worldinfo/get')) {
+            if (body.name === 'Bad/Name') return json({ error: 'bad name' }, 400);
+            return json({ entries: { e1: { key: ['k'], content: '世界书正文' } } });
+        }
+        if (url.includes('/api/backgrounds/all')) {
+            return json({ images: ['bg1.jpg', 'folder/bg2.png', 'https://cdn.example/x.png'] });
+        }
+        if (url.includes('/api/avatars/get')) return json(['me.png']);
+
+        // 图片字节：TT 那边是前端相对路径，不是 /api/...
+        if (url.startsWith('backgrounds/') || url.startsWith('User Avatars/')) {
+            return new Response(PNG, { headers: { 'Content-Type': imageType } });
+        }
+        return json({});
+    };
+
+    return { impl, seen, PNG };
+}
+
+/** 解析出来的条目按名字查一条，读回它的字节 */
+async function readZipEntry(reader, name) {
+    const entry = reader.entries.find((item) => item.name === name);
+    if (!entry) return null;
+    return Buffer.from(await reader.readBytes(entry));
+}
+
+/** TT 酒馆：buildLocalBackup 必须走逐类读，拼出来的包要能被云侧那份 ZipReader 读回去 */
+async function testTtBackupBuild(bad_) {
+    console.log('\n── 上传绕行：TT 上逐类读 + 拼 zip ──');
+    const { impl, seen, PNG } = makeTtReadFetch();
+    const { api } = loadExtension({ fetchImpl: impl, tav: true, seed: configSeed('http://relay.test') });
+
+    const { value: blob, lines } = await withLogs(() => api.buildLocalBackup());
+
+    if (!(blob instanceof Blob)) {
+        bad('buildLocalBackup 没返回 Blob', String(blob));
+        return;
+    }
+    if (seen.some((c) => c.url.includes('/api/users/backup'))) {
+        bad('TT 分叉还在调 /api/users/backup', 'iOS 上这条路读不出 body，等于白跑');
+    } else {
+        ok('没碰 /api/users/backup（走的逐类读）');
+    }
+
+    const reader = new api.ZipReader(blob);
+    await reader.parse();
+    const names = reader.entries.map((e) => e.name);
+
+    // 该进包的
+    const wanted = [
+        'characters/Alice.png',
+        'chats/Alice/chat1.jsonl',
+        'groups/g1.json',
+        'group chats/gc1.jsonl',
+        'worlds/WorldA.json',
+        'backgrounds/bg1.jpg',
+        'backgrounds/folder/bg2.png',
+        'User Avatars/me.png',
+        'settings.json',
+    ];
+    const missing = wanted.filter((n) => !names.includes(n));
+    if (missing.length) bad('该进包的条目少了', `缺 ${JSON.stringify(missing)}；实际 ${JSON.stringify(names)}`);
+    else ok(`条目齐了（${names.length} 条）：角色卡/聊天/群组/群聊/世界书/图片/设置`);
+
+    // 不该进包的
+    const unwanted = ['characters/Bad/Name.png', 'worlds/Bad/Name.json', 'group chats/gc2.jsonl'];
+    const leaked = unwanted.filter((n) => names.includes(n));
+    if (leaked.length) bad('不该进包的条目混进来了', JSON.stringify(leaked));
+    else ok('边角料都挡住了（带斜杠的名字、读不出来的群聊）');
+
+    if (names[names.length - 1] !== 'settings.json') {
+        bad('settings.json 不在最后', `最后一条是 ${names[names.length - 1]}`);
+    } else {
+        ok('settings.json 排在最后（它引用了前面那些东西）');
+    }
+
+    // 内容对得上：角色卡必须是原始字节（不能是 JSON 包一层），聊天必须是 JSONL
+    const card = await readZipEntry(reader, 'characters/Alice.png');
+    if (!card || !card.equals(Buffer.from(PNG))) bad('角色卡字节不对', card ? card.toString('hex') : '（没读到）');
+    else ok('角色卡是导出的原始 PNG 字节（没被转成 JSON）');
+
+    const chat = await readZipEntry(reader, 'chats/Alice/chat1.jsonl');
+    const chatLines = chat ? chat.toString('utf8').trim().split('\n') : [];
+    let parsed = [];
+    try {
+        parsed = chatLines.map((line) => JSON.parse(line));
+    } catch (err) {
+        bad('聊天不是合法的 JSONL', String(err.message));
+    }
+    if (parsed.length === 2 && parsed[0].mes === '你好' && parsed[1].mes === '在') {
+        ok('聊天按 JSONL 存（一行一条消息），云侧 stParseJsonl 能直接读');
+    } else {
+        bad('聊天内容不对', chat ? JSON.stringify(chat.toString('utf8').slice(0, 120)) : '（没读到）');
+    }
+
+    const group = await readZipEntry(reader, 'groups/g1.json');
+    let groupJson = null;
+    try { groupJson = JSON.parse(group.toString('utf8')); } catch { /* 下面统一报 */ }
+    if (groupJson && groupJson.id === 'g1') ok('群组存成 groups/<id>.json（写回时 id 直接可用）');
+    else bad('群组内容不对', group ? group.toString('utf8').slice(0, 120) : '（没读到）');
+
+    // 请求参数也得对：聊天目录名由 avatar_url 决定，云侧要靠它反推角色
+    const chatCalls = seen.filter((c) => c.url.includes('/api/chats/get'));
+    if (chatCalls.length !== 1 || chatCalls[0].body.avatar_url !== 'Alice.png'
+        || chatCalls[0].body.file_name !== 'chat1.jsonl') {
+        bad('读聊天的请求参数不对', JSON.stringify(chatCalls.map((c) => c.body)));
+    } else {
+        ok('读聊天带的是 {avatar_url, file_name}（avatar 真名，不是显示名）');
+    }
+
+    // 外链背景不该去取
+    if (seen.some((c) => c.url.includes('cdn.example'))) {
+        bad('去取了外链背景图', '那是用户的外链，不属于备份内容');
+    } else {
+        ok('外链背景图没去取（不属于本机数据）');
+    }
+
+    // 手机上唯一的线索就是面板日志：分类计数和"跳过了什么"必须落进去
+    const text = lines.join('\n');
+    // 角色卡是 1 张不是 2 张：名字里带斜杠的那张在进包前就被挡掉了
+    const needed = ['角色卡 1 张', '世界书 1/2 本', '跳过预设', '跳过主题', '跳过聊天附件'];
+    for (const need of needed) {
+        if (!text.includes(need)) bad(`日志里没有「${need}」`, '手机上看不到这一步的进展/缺口');
+    }
+    if (needed.every((need) => text.includes(need))) {
+        ok('逐类计数和"跳过哪些类"都进了面板日志');
+    }
+}
+
+/** TT 上没有读接口的类（图片/附件/预设…）跳过就行，但不能连累 Tier1 的数据 */
+async function testTtImagesWithoutBytes(bad_) {
+    console.log('\n── 上传绕行：图片取不到字节时 ──');
+    // TT 后端没有"按路径读图片"的 HTTP 接口，取回来的很可能是前端页面（200 + text/html）
+    const { impl } = makeTtReadFetch({ imageType: 'text/html' });
+    const { api } = loadExtension({ fetchImpl: impl, tav: true, seed: configSeed('http://relay.test') });
+
+    const { value: blob, lines } = await withLogs(() => api.buildLocalBackup());
+    const reader = new api.ZipReader(blob);
+    await reader.parse();
+    const names = reader.entries.map((e) => e.name);
+
+    if (names.some((n) => n.startsWith('backgrounds/') || n.startsWith('User Avatars/'))) {
+        bad('把 HTML 当图片塞进包里了', JSON.stringify(names.filter((n) => n.startsWith('backgrounds/'))));
+    } else {
+        ok('不是图片就当没有（宁可少这一类，也不往包里塞 HTML）');
+    }
+    if (!names.includes('characters/Alice.png') || !names.includes('settings.json')) {
+        bad('图片取不到却把 Tier1 的数据也弄丢了', JSON.stringify(names));
+    } else {
+        ok('图片取不到不影响角色卡/设置这些主力数据');
+    }
+    if (!lines.join('\n').includes('只取到 0 张')) {
+        bad('没在日志里说明图片少了', '用户会以为备份是全的');
+    } else {
+        ok('日志里说明了图片一张都没取到');
+    }
+}
+
+/** 原版 ST 的备份接口是好的：那边必须继续走老路，别退化成几百个请求 */
+async function testClassicStaysOnBackupApi(bad_) {
+    console.log('\n── 分叉：原版 ST 仍走 /api/users/backup ──');
+    const { api, calls } = loadExtension({
+        fetchImpl: async (url) => (url.includes('/api/users/backup')
+            ? new Response(new Uint8Array([0x50, 0x4b, 3, 4]), { headers: { 'Content-Type': 'application/zip' } })
+            : json({})),
+        tav: false,
+        seed: configSeed('http://relay.test'),
+    });
+
+    const blob = await api.buildLocalBackup();
+    if (blob.size !== 4) bad('拿到的不是酒馆给的那份字节', String(blob.size));
+    else ok('原版 ST 仍直接拿 /api/users/backup 的字节');
+
+    const strays = calls.filter((c) => /\/api\/(characters|chats|worldinfo|groups)\//.test(c.url));
+    if (strays.length) bad('原版 ST 上跑了逐类读', JSON.stringify(strays.map((c) => c.url)));
+    else ok('原版 ST 上没走逐类读（那边后端打包又快又全）');
+}
+
+/**
+ * 拼 zip 这一侧。
+ *
+ * 圆进圆出只是自证；真正算数的是**换个实现来读**：Python 的 zipfile 是另一套代码，
+ * 它肯认这个包（testzip 校验 CRC、名字按 UTF-8 解开），才说明这包是合规的 zip，
+ * 而不是"恰好我们的 ZipReader 能读"。
+ */
+async function testZipWriter(bad_) {
+    console.log('\n── buildZip：store-only zip 打包 ──');
+    const { api } = loadExtension({ fetchImpl: async () => json({}) });
+
+    // crc32 的标准向量：任何实现算 123456789 都得是 0xCBF43926
+    const vector = api.crc32(new TextEncoder().encode('123456789'));
+    if (vector !== 0xcbf43926) bad('crc32 不是标准值', `期望 CBF43926，实际 ${vector.toString(16)}`);
+    else ok('crc32 对上标准向量（123456789 → 0xCBF43926）');
+    if (api.crc32(new Uint8Array(0)) !== 0) bad('空内容的 crc32 不是 0', '');
+    else ok('空内容的 crc32 = 0');
+
+    const png = new Uint8Array(257);
+    for (let i = 0; i < png.length; i += 1) png[i] = i & 0xff;   // 含 0x00/0xff 的二进制，最容易在拼接处出错
+    const entries = [
+        { name: 'settings.json', data: '{"theme":"dark"}' },
+        { name: 'characters/爱丽丝.png', data: png },
+        { name: 'chats/爱丽丝/深夜.jsonl', data: '{"mes":"hi"}\n{"mes":"啊"}\n' },
+        { name: 'empty.txt', data: new Uint8Array(0) },
+    ];
+    const blob = api.buildZip(entries, { date: new Date(2026, 9, 1, 12, 34, 56) });
+
+    const reader = new api.ZipReader(blob);
+    await reader.parse();
+    if (reader.entries.length !== entries.length) {
+        bad('解回来的条目数不对', `${reader.entries.length} ≠ ${entries.length}：${reader.entries.map((e) => e.name)}`);
+    } else {
+        ok(`圆进圆出：${reader.entries.length} 条全解回来`);
+    }
+
+    for (const item of entries) {
+        const got = await readZipEntry(reader, item.name);
+        const want = Buffer.from(typeof item.data === 'string' ? item.data : item.data);
+        if (!got) bad(`条目 ${item.name} 丢了`, reader.entries.map((e) => e.name).join(', '));
+        else if (!got.equals(want)) bad(`条目 ${item.name} 字节对不上`, `${got.length} 字节 ≠ ${want.length} 字节`);
+    }
+    ok('每条名字和字节都逐一比对过（含中文名、含空文件）');
+
+    // 头必须是 store（method 0）+ UTF-8 名字标志，缺了别的解压器会当乱码
+    const head = new DataView(await blob.slice(0, 30).arrayBuffer());
+    if (head.getUint32(0, true) !== 0x04034b50) bad('开头不是 PK\\x03\\x04', '');
+    else if (head.getUint16(8, true) !== 0) bad('压缩方式不是 store', String(head.getUint16(8, true)));
+    else if ((head.getUint16(6, true) & 0x0800) === 0) bad('没置 UTF-8 名字标志', '中文名会在别的工具里变乱码');
+    else ok('局部头：PK\\x03\\x04 + store(0) + UTF-8 名字标志');
+
+    // 换个实现来读：Python zipfile
+    const tmp = path.join(os.tmpdir(), `st-sync-zip-${process.pid}.zip`);
+    fs.writeFileSync(tmp, Buffer.from(await blob.arrayBuffer()));
+    let py = null;
+    try {
+        // 输出必须是纯 ASCII：Windows 上 Python 打到管道用的是本地编码（GBK），
+        // 非 ASCII 的名字在 Node 这边按 UTF-8 一解就是乱码 —— 那是测试自己的锅，不是包的锅
+        py = execFileSync('python', ['-c', `
+import sys, json, zipfile, hashlib
+with zipfile.ZipFile(sys.argv[1]) as z:
+    out = {"bad": z.testzip(), "items": {}}
+    for n in z.namelist():
+        data = z.read(n)
+        out["items"][n] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+print(json.dumps(out))
+`, tmp], { encoding: 'utf8' });
+    } catch (err) {
+        console.log(`  ⚠ 跳过 Python 交叉验证（没跑起来）：${err.message.split('\n')[0]}`);
+    } finally {
+        fs.unlinkSync(tmp);
+    }
+
+    if (py) {
+        const result = JSON.parse(py);
+        if (result.bad) bad('Python 的 testzip 判包损坏', `CRC 对不上的条目：${result.bad}`);
+        else ok('Python zipfile 的 testzip 通过（CRC 全部校验合格）');
+
+        const pyNames = Object.keys(result.items);
+        const mineNames = entries.map((e) => e.name);
+        if (JSON.stringify(pyNames) !== JSON.stringify(mineNames)) {
+            bad('Python 解出来的名字不对', `Python：${JSON.stringify(pyNames)}`);
+        } else {
+            ok('Python 解出来的名字一致（中文名按 UTF-8 正确还原）');
+        }
+
+        let mismatch = 0;
+        for (const item of entries) {
+            const want = Buffer.from(typeof item.data === 'string' ? item.data : item.data);
+            const got = result.items[item.name];
+            const sum = crypto.createHash('sha256').update(want).digest('hex');
+            if (!got) {
+                mismatch += 1;
+                bad(`Python 没解出 ${item.name}`, '');
+            } else if (got.size !== want.length || got.sha256 !== sum) {
+                mismatch += 1;
+                bad(`${item.name} 字节对不上（Python 侧）`, `${got.size}/${got.sha256.slice(0, 12)} ≠ ${want.length}/${sum.slice(0, 12)}`);
+            }
+        }
+        if (!mismatch) ok('每个条目的字节都和 Python 解出来的一致（换实现交叉验证）');
+    }
+
+    // 超限得报错，不能悄悄打出一个坏包
+    let err = null;
+    try {
+        api.buildZip([{ name: 'big.bin', data: new Uint8Array(1) }]);
+    } catch (e) { err = e; }
+    if (err) bad('普通条目居然报错了', err.message);
+    else ok('正常条目不报错（没把上限判断写反）');
+}
+
 /* ------------------------------------------------------------------- main */
 
 async function main() {
@@ -638,6 +979,10 @@ async function main() {
     await testJobOutcomes(bad);
     await testImportSubmitFailure(bad);
     await testDiagnostics(bad);
+    await testZipWriter(bad);
+    await testTtBackupBuild(bad);
+    await testTtImagesWithoutBytes(bad);
+    await testClassicStaysOnBackupApi(bad);
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`通过 ${pass}　失败 ${fail}`);

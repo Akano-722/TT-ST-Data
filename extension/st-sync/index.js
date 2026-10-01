@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-01.2';
+const EXT_VERSION = '2026-10-01.3';
 
 /**
  * 日志也往面板里记一份。
@@ -508,6 +508,11 @@ async function currentHandle() {
 }
 
 async function buildLocalBackup() {
+    // 平台分叉：TT 酒馆在 iOS 上拿不到 /api/users/backup 的字节（读 body 抛 forbidden path，
+    // 见 tools/tt-tavern-api.md 第 3 节），只能逐类读、自己拼 zip；原版 ST 的备份接口是好的，
+    // 保持原样别动 —— 那边后端直接打包，比逐类读快得多，也全得多。
+    if (isTauriTavern()) return await buildTtBackup();
+
     const handle = await currentHandle();
     const res = await timedFetch(ST_API.download.url, {
         method: ST_API.download.method,
@@ -528,6 +533,324 @@ async function buildLocalBackup() {
     }
     const blob = await res.blob();
     if (!blob.size) throw new Error('酒馆返回的备份是空的');
+    return blob;
+}
+
+/* ==================================================================== *
+ * TT 酒馆的上传绕行：逐类读 + 自己拼 zip
+ *
+ * 为什么绕：iOS 上 `POST /api/users/backup` 的头能回来、body 读不出（TT 自己的 fs scope
+ * 失误，`forbidden path`），这条路走不通了（tools/tt-tavern-api.md 第 3 节）。
+ * 好在 TT 每个类都有"读"的接口，逐类读回来自己拼一个 zip 就行 ——
+ * 布局照 restore 侧的规格来，云侧（原版 ST）的恢复逻辑一行都不用改。
+ *
+ * 接口全是 POST + JSON（和原版 ST 的 GET 不一样），出处 src/tauri/main/routes/*.js：
+ *   /api/settings/get        整份设置。**世界书名单也在这里**（settings.world_names）
+ *   /api/characters/all      角色卡列表（.avatar 是真实文件名，聊天目录名由它决定）
+ *   /api/characters/export   {avatar_url, format:'png'} → 角色卡原始字节
+ *   /api/characters/chats    {avatar_url} → 这个角色有哪些聊天
+ *   /api/chats/get           {avatar_url, file_name} → 消息数组
+ *   /api/groups/all          群组（.chats 是它的群聊 id 列表）
+ *   /api/chats/group/get     {id} → 群聊消息数组
+ *   /api/worldinfo/get       {name} → 世界书内容
+ *
+ * 读不出来的（TT 根本没提供读接口）：预设 / 主题 / 快捷回复 / 界面布局 / 图片 / 聊天附件。
+ * 这几类跳过，并在日志里写明 —— 用户已经同意"尽力而为"，但得让人知道少了什么。
+ * ==================================================================== */
+
+const TT_API = {
+    settingsGet: '/api/settings/get',
+    charactersAll: '/api/characters/all',
+    characterExport: '/api/characters/export',
+    characterChats: '/api/characters/chats',
+    chatGet: '/api/chats/get',
+    groupsAll: '/api/groups/all',
+    groupChatGet: '/api/chats/group/get',
+    worldGet: '/api/worldinfo/get',
+    backgroundsAll: '/api/backgrounds/all',
+    avatarsGet: '/api/avatars/get',
+};
+
+/** TT 没有读接口的类，日志里点名跳过（接口名照抄源码，方便以后复核有没有补上） */
+const TT_NO_READ_API = [
+    ['/api/presets/*', '预设'],
+    ['/api/themes/*', '主题'],
+    ['/api/quick-replies/*', '快捷回复'],
+    ['movingUI', '界面布局'],
+    ['/api/images/*', '图片'],
+    ['/api/files/*', '聊天附件'],
+];
+
+/**
+ * TT 的 JSON 读接口。
+ * 复用 stFetch/stMustOk：同一份 getRequestHeaders、同一套超时和日志，
+ * 而且这两个接口出错时都会老实回 `{error}`，stMustOk 认得出来。
+ */
+async function ttReadJson(url, body, what) {
+    const { json } = await stMustOk(await stFetch(url, { json: body || {} }), what);
+    return json;
+}
+
+/** 少数接口回的是原始字节（角色卡导出），走不了 JSON 那条路 */
+async function ttReadBytes(url, body, what) {
+    const res = await timedFetch(url, {
+        method: 'POST',
+        headers: ctx().getRequestHeaders(),
+        body: JSON.stringify(body || {}),
+    }, { timeoutMs: TIMEOUT_MS.st, what });
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`${what} 失败 HTTP ${res.status}${detail ? `：${detail.slice(0, 200)}` : ''}`);
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (!bytes.length) throw new Error(`${what}：酒馆回了个空文件`);
+    return bytes;
+}
+
+/** 条目名里的单个文件名：带路径分隔符的一律不收，否则条目会跑到别的目录去 */
+function ttSafeName(name) {
+    const text = String(name === null || name === undefined ? '' : name);
+    if (!text || text === '.' || text === '..' || /[\/\\]/.test(text)) return '';
+    return text;
+}
+
+/** 相对路径（图片可能带子目录）：逐段检查，压平掉 '..' 这种 */
+function ttSafePath(path) {
+    const parts = String(path || '').split('/').map((part) => ttSafeName(part));
+    return parts.every(Boolean) ? parts.join('/') : '';
+}
+
+/** 消息数组 → jsonl。云侧 stParseJsonl 是一行一条读回来的，格式必须对得上 */
+function jsonlOf(messages, what) {
+    if (!Array.isArray(messages)) throw new Error(`${what}：酒馆回的不是消息数组`);
+    if (!messages.length) throw new Error(`${what}：没有任何消息`);
+    return `${messages.map((message) => JSON.stringify(message)).join('\n')}\n`;
+}
+
+/**
+ * 逐类把数据读出来，拼成 zip 条目的数组。
+ *
+ * 顺序照 RESTORE_ORDER 的意思来：角色卡 → 它的聊天 → 群组 → 群聊 → 世界书 → 设置（放最后）。
+ * 每类都记一行日志：手机上出问题只能靠面板日志，必须看得出"读到哪一步、读到了多少"。
+ *
+ * @returns {Promise<{entries: Array, skipped: string[]}>}
+ */
+async function collectTtEntries() {
+    const entries = [];
+    const skipped = [];
+
+    const step = (what) => {
+        STATE.step = what;
+        renderStatus();
+    };
+
+    // ---- 设置：整份最后的条目，但得先读，因为世界书名单只在它里面 ----
+    step('读设置');
+    const settings = await ttReadJson(TT_API.settingsGet, {}, '读设置');
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+        throw new Error('读设置：酒馆回的不是一个对象，读接口可能对不上');
+    }
+    const worldNames = Array.isArray(settings.world_names) ? settings.world_names.filter(Boolean) : [];
+    log(`逐类读：设置 1 份，里面记着 ${worldNames.length} 本世界书`);
+
+    // ---- 角色卡 + 每个角色的聊天 ----
+    const characters = await ttReadJson(TT_API.charactersAll, {}, '列角色卡');
+    const cards = (Array.isArray(characters) ? characters : [])
+        .map((item) => ({ avatar: ttSafeName(item && item.avatar) }))
+        .filter((card) => card.avatar);
+    log(`逐类读：角色卡 ${cards.length} 张`);
+
+    for (const card of cards) {
+        // 聊天目录名 = 头像文件名去掉 .png（TT 侧 resolveCharacterDirectoryId 的规则），
+        // 云侧 writeChat 又拿它反推回 `<card>.png`，两头必须一致
+        const stem = card.avatar.replace(/\.png$/i, '');
+        step(`导出角色卡 ${card.avatar}`);
+        try {
+            const bytes = await ttReadBytes(
+                TT_API.characterExport,
+                { avatar_url: card.avatar, format: 'png' },
+                `导出角色卡 ${card.avatar}`,
+            );
+            entries.push({ name: `characters/${card.avatar}`, data: bytes });
+        } catch (err) {
+            log(`跳过角色卡 ${card.avatar}`, err);
+            skipped.push(`角色卡 ${card.avatar}：${err.message}`);
+            continue; // 卡片都没读到，它的聊天也就不管了
+        }
+
+        let chats;
+        try {
+            chats = await ttReadJson(TT_API.characterChats, { avatar_url: card.avatar }, `列 ${stem} 的聊天`);
+        } catch (err) {
+            log(`列 ${stem} 的聊天失败`, err);
+            skipped.push(`${stem} 的聊天列表：${err.message}`);
+            continue;
+        }
+
+        for (const chat of Array.isArray(chats) ? chats : []) {
+            const fileId = ttSafeName(chat && (chat.file_id || chat.file_name));
+            if (!fileId) continue;
+            const id = fileId.replace(/\.jsonl$/i, '');
+            step(`读聊天 ${id}`);
+            try {
+                const messages = await ttReadJson(
+                    TT_API.chatGet,
+                    { avatar_url: card.avatar, file_name: `${id}.jsonl` },
+                    `读聊天 ${id}`,
+                );
+                entries.push({ name: `chats/${stem}/${id}.jsonl`, data: jsonlOf(messages, `聊天 ${id}`) });
+            } catch (err) {
+                log(`跳过聊天 ${id}`, err);
+                skipped.push(`聊天 ${stem}/${id}：${err.message}`);
+            }
+        }
+    }
+
+    // ---- 群组 + 群聊 ----
+    const groups = await ttReadJson(TT_API.groupsAll, {}, '列群组');
+    const groupList = Array.isArray(groups) ? groups : [];
+    log(`逐类读：群组 ${groupList.length} 个`);
+
+    for (const group of groupList) {
+        const groupId = ttSafeName(group && (group.id || group.chat_id));
+        if (!groupId) continue;
+        entries.push({ name: `groups/${groupId}.json`, data: JSON.stringify(group, null, 2) });
+
+        // 群聊 id 列表：chats 是历史，chat_id 是当前，取并集免得漏
+        const chatIds = new Set(Array.isArray(group.chats) ? group.chats.filter(Boolean) : []);
+        if (group.chat_id) chatIds.add(group.chat_id);
+
+        for (const rawId of chatIds) {
+            const chatId = ttSafeName(rawId);
+            if (!chatId) continue;
+            step(`读群聊 ${chatId}`);
+            try {
+                const messages = await ttReadJson(TT_API.groupChatGet, { id: chatId }, `读群聊 ${chatId}`);
+                entries.push({ name: `group chats/${chatId}.jsonl`, data: jsonlOf(messages, `群聊 ${chatId}`) });
+            } catch (err) {
+                log(`跳过群聊 ${chatId}`, err);
+                skipped.push(`群聊 ${chatId}：${err.message}`);
+            }
+        }
+    }
+
+    // ---- 世界书（名字来自 settings.world_names，TT 没有"列世界书"的接口）----
+    let worldOk = 0;
+    for (const name of worldNames) {
+        const safe = ttSafeName(name);
+        if (!safe) {
+            skipped.push(`世界书 ${name}：名字里有路径分隔符，跳过`);
+            continue;
+        }
+        step(`读世界书 ${safe}`);
+        try {
+            const data = await ttReadJson(TT_API.worldGet, { name }, `读世界书 ${safe}`);
+            entries.push({ name: `worlds/${safe}.json`, data: JSON.stringify(data, null, 2) });
+            worldOk += 1;
+        } catch (err) {
+            log(`跳过世界书 ${safe}`, err);
+            skipped.push(`世界书 ${safe}：${err.message}`);
+        }
+    }
+    log(`逐类读：世界书 ${worldOk}/${worldNames.length} 本`);
+
+    // ---- 背景图 / 用户头像：TT 只给"名字列表"，字节得自己按前端那套相对路径去取 ----
+    await collectTtImages(entries, skipped);
+
+    // ---- 设置放最后 ----
+    entries.push({ name: 'settings.json', data: JSON.stringify(settings, null, 2) });
+
+    // ---- 读不出来的类，点名跳过 ----
+    for (const [api, label] of TT_NO_READ_API) {
+        skipped.push(`跳过${label}：TT 没有读接口（${api}）`);
+    }
+
+    return { entries, skipped };
+}
+
+/**
+ * 背景图和用户头像的字节：TT 这两个类只提供"名字列表"接口，图片本身交给 Tauri 的
+ * asset 协议 / 前端的相对路径去取（后端并没有一个"按路径读文件"的 HTTP 接口）。
+ *
+ * 所以这里是**尽力而为**：照前端用的相对路径取一次，取回来不是图片（多半是前端页面
+ * 的 HTML，状态码还是 200）就当没有，记进 skipped。宁可少这一类，也不往包里塞垃圾。
+ */
+async function collectTtImages(entries, skipped) {
+    const fetchImage = async (url, what) => {
+        try {
+            const res = await timedFetch(url, { method: 'GET' }, { timeoutMs: TIMEOUT_MS.st, what });
+            if (!res.ok) return null;
+            const type = String(res.headers.get('content-type') || '');
+            if (!/^image\//i.test(type)) return null;
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            return bytes.length ? bytes : null;
+        } catch (err) {
+            log(`${what} 取不到`, err);
+            return null;
+        }
+    };
+
+    let bgOk = 0;
+    let bgTotal = 0;
+    try {
+        const list = await ttReadJson(TT_API.backgroundsAll, {}, '列背景图');
+        const images = (list && Array.isArray(list.images)) ? list.images : [];
+        bgTotal = images.length;
+        for (const raw of images) {
+            const rel = String(raw || '');
+            // 自定义 URL（http 开头）本来就不在备份里，是用户外链
+            if (!rel || /^[a-z][a-z0-9+.-]*:/i.test(rel)) continue;
+            const safe = ttSafePath(rel);
+            if (!safe) continue;
+            const bytes = await fetchImage(`backgrounds/${encodeURI(rel)}`, `取背景图 ${rel}`);
+            if (!bytes) continue;
+            entries.push({ name: `backgrounds/${safe}`, data: bytes });
+            bgOk += 1;
+        }
+    } catch (err) {
+        log('列背景图失败', err);
+        skipped.push(`背景图：${err.message}`);
+    }
+    if (bgTotal && bgOk < bgTotal) {
+        skipped.push(`背景图：${bgTotal} 张里只取到 ${bgOk} 张（TT 没有按路径读字节的接口）`);
+    }
+
+    let avatarOk = 0;
+    let avatarTotal = 0;
+    try {
+        const names = await ttReadJson(TT_API.avatarsGet, {}, '列用户头像');
+        avatarTotal = (Array.isArray(names) ? names : []).length;
+        for (const raw of Array.isArray(names) ? names : []) {
+            const safe = ttSafeName(raw);
+            if (!safe) continue;
+            const bytes = await fetchImage(`User Avatars/${encodeURIComponent(safe)}`, `取用户头像 ${safe}`);
+            if (!bytes) continue;
+            entries.push({ name: `User Avatars/${safe}`, data: bytes });
+            avatarOk += 1;
+        }
+    } catch (err) {
+        log('列用户头像失败', err);
+        skipped.push(`用户头像：${err.message}`);
+    }
+    if (avatarTotal && avatarOk < avatarTotal) {
+        skipped.push(`用户头像：${avatarTotal} 张里只取到 ${avatarOk} 张（TT 没有按路径读字节的接口）`);
+    }
+}
+
+/** TT 上传侧入口：逐类读 → 拼 zip → 交给 pushToRelay 原样 PUT */
+async function buildTtBackup() {
+    log('本机是 TT 酒馆：逐类读数据、自己拼 zip（iOS 上 /api/users/backup 读不出 body）');
+
+    const { entries, skipped } = await collectTtEntries();
+    if (!entries.length) throw new Error('没能从酒馆读到任何数据，先看面板日志');
+
+    const blob = buildZip(entries);
+    log(`拼好 zip：${entries.length} 个条目，${(blob.size / 1048576).toFixed(2)} MB`);
+
+    if (skipped.length) {
+        log(`有 ${skipped.length} 项没进包：`);
+        for (const line of skipped) log(`  · ${line}`);
+    }
     return blob;
 }
 
@@ -951,6 +1274,163 @@ class ZipReader {
 }
 
 // ==== ZIP-READER-END ====
+
+/* ==================================================================== *
+ * 浏览器端 zip 打包（store-only）
+ *
+ * 只给 TT 酒馆的上传侧用：iOS 上拿不到 /api/users/backup 的字节（见 tools/tt-tavern-api.md
+ * 第 3 节），只能自己逐类读、自己拼一个 zip。拼出来的包要能被**云侧那份 ZipReader**读回去，
+ * 也要能和酒馆自己导出的包长得一样 —— 所以布局、文件名都得照 restore 侧的规格来。
+ *
+ * 为什么只 store（method 0）不 deflate：
+ *   1. 压缩得引第三方库，而这个文件一条 import 都不能有（见文件头）；
+ *   2. 包里主要是 PNG/JPEG（本来就压过）和聊天 JSONL，压不压体积差不了多少。
+ * 代价是包比"酒馆自己导出的"大一些，换来的是零依赖、字节完全可预测。
+ * 云侧 ZipReader 读到 method 0 是原样返回、不校验 CRC，兼容没问题。
+ * ==================================================================== */
+// ==== ZIP-WRITER-BEGIN ====
+
+/** 解压需要的版本号：store 其实 1.0 就够，写 2.0 是所有解压器都吃的通用值 */
+const ZIP_WRITER_VERSION = 20;
+/** bit 11：文件名按 UTF-8 编码存（中文名/中文角色卡必须置，否则到处乱码） */
+const ZIP_FLAG_UTF8 = 0x0800;
+/** 条目数、单条目大小都用 16/32 位字段存，超了就要 Zip64 —— 这里不做，超了直接报错 */
+const ZIP_MAX_ENTRIES = 0xffff;
+const ZIP_MAX_BYTES = 0xffffffff;
+
+const zipTextEncoder = new TextEncoder();
+
+let crc32Table = null;
+
+/**
+ * 标准 CRC-32（IEEE 802.3，和 zlib/zip 用的是同一个多项式）。
+ * zip 规范要求每个文件都带上内容的 CRC，校验不过的解压器会直接判包损坏。
+ */
+function crc32(bytes) {
+    if (!crc32Table) {
+        crc32Table = new Uint32Array(256);
+        for (let i = 0; i < 256; i += 1) {
+            let c = i;
+            for (let k = 0; k < 8; k += 1) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+            crc32Table[i] = c >>> 0;
+        }
+    }
+
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i += 1) {
+        crc = crc32Table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+/** 条目的内容可以是字符串（当 UTF-8 文本）、Uint8Array 或 ArrayBuffer，统一成字节数组 */
+function zipBytes(data) {
+    if (typeof data === 'string') return zipTextEncoder.encode(data);
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    throw new Error('zip 条目的内容只能是字符串、Uint8Array 或 ArrayBuffer');
+}
+
+/** DOS 时间戳：zip 头里用的是 1980 起的年月日 + 2 秒精度的时分秒 */
+function zipDosStamp(date) {
+    const d = date || new Date();
+    const year = Math.max(1980, d.getFullYear());
+    return {
+        time: (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2),
+        date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+    };
+}
+
+/**
+ * 打一个 store-only 的 zip。
+ *
+ * 不建目录项：解压侧按路径前缀分类（classifyRestoreEntry），不需要目录条目，
+ * 而目录条目有时还会被某些解压器当成"空文件"处理，多余。
+ *
+ * @param {Array<{name: string, data: string|Uint8Array|ArrayBuffer}>} entries
+ * @param {{date?: Date}} [options] 时间戳，测试里固定住用
+ * @returns {Blob}
+ */
+function buildZip(entries, { date } = {}) {
+    const list = (entries || []).filter((item) => item && item.name);
+    if (list.length > ZIP_MAX_ENTRIES) {
+        throw new Error(`条目太多（${list.length} 个），超过 zip 的 65535 上限，需要 Zip64 —— 不做了`);
+    }
+
+    const stamp = zipDosStamp(date);
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+
+    for (const item of list) {
+        const nameBytes = zipTextEncoder.encode(String(item.name));
+        const data = zipBytes(item.data);
+        if (data.length > ZIP_MAX_BYTES || offset + data.length > ZIP_MAX_BYTES) {
+            throw new Error(`条目 ${item.name} 太大，超过 4GB 上限，需要 Zip64 —— 不做了`);
+        }
+        const sum = crc32(data);
+
+        // 局部头 + 内容：解压器实际是顺着中央目录找过来的，但头部字段必须自洽
+        const local = new Uint8Array(30 + nameBytes.length);
+        const lv = new DataView(local.buffer);
+        lv.setUint32(0, ZIP_SIG_LOCAL, true);
+        lv.setUint16(4, ZIP_WRITER_VERSION, true);
+        lv.setUint16(6, ZIP_FLAG_UTF8, true);
+        lv.setUint16(8, 0, true);                 // method 0 = store
+        lv.setUint16(10, stamp.time, true);
+        lv.setUint16(12, stamp.date, true);
+        lv.setUint32(14, sum, true);
+        lv.setUint32(18, data.length, true);      // 未压缩大小
+        lv.setUint32(22, data.length, true);      // 压缩后大小（store 时两者相同）
+        lv.setUint16(26, nameBytes.length, true);
+        lv.setUint16(28, 0, true);                // 扩展区长度
+        local.set(nameBytes, 30);
+
+        const central = new Uint8Array(46 + nameBytes.length);
+        const cv = new DataView(central.buffer);
+        cv.setUint32(0, ZIP_SIG_CENTRAL, true);
+        cv.setUint16(4, ZIP_WRITER_VERSION, true);   // version made by（高字节 0 = MS-DOS/FAT）
+        cv.setUint16(6, ZIP_WRITER_VERSION, true);   // version needed
+        cv.setUint16(8, ZIP_FLAG_UTF8, true);
+        cv.setUint16(10, 0, true);                   // method
+        cv.setUint16(12, stamp.time, true);
+        cv.setUint16(14, stamp.date, true);
+        cv.setUint32(16, sum, true);
+        cv.setUint32(20, data.length, true);
+        cv.setUint32(24, data.length, true);
+        cv.setUint16(28, nameBytes.length, true);
+        cv.setUint16(30, 0, true);                   // 扩展区长度
+        cv.setUint16(32, 0, true);                   // 注释长度
+        cv.setUint16(34, 0, true);                   // 起始磁盘号
+        cv.setUint16(36, 0, true);                   // 内部属性
+        cv.setUint32(38, 0, true);                   // 外部属性（没建目录项，权限位无所谓）
+        cv.setUint32(42, offset, true);              // 对应局部头的偏移
+        central.set(nameBytes, 46);
+
+        localParts.push(local, data);
+        centralParts.push(central);
+        offset += local.length + data.length;
+    }
+
+    const centralSize = centralParts.reduce((n, part) => n + part.length, 0);
+
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, ZIP_SIG_EOCD, true);
+    ev.setUint16(4, 0, true);                        // 本磁盘号
+    ev.setUint16(6, 0, true);                        // 中央目录起始磁盘号
+    ev.setUint16(8, list.length, true);              // 本磁盘上的条目数
+    ev.setUint16(10, list.length, true);             // 总条目数
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, offset, true);                  // 中央目录起始偏移
+    ev.setUint16(20, 0, true);                       // 注释长度
+
+    // 内容直接进 Blob（浏览器里按引用算，不会先拷进 JS 堆），只有头是现拼的
+    return new Blob([...localParts, ...centralParts, eocd], { type: 'application/zip' });
+}
+
+// ==== ZIP-WRITER-END ====
 
 /* ==================================================================== *
  * 恢复：把备份拆开，按类用酒馆自己的"保存"接口写回去

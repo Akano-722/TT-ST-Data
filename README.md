@@ -43,26 +43,70 @@ SillyTavern 的备份/恢复接口在不同版本间改过，猜错会表现为"
 
 ### 2. 部署中转服务
 
-本地先跑通：
+#### 2.1 推到你的 Git 仓库
+
+Zeabur 是从 Git 仓库拉代码部署的，所以先得有个远程仓库。用它**明确支持的 GitHub**（GitLab 也行）
+建一个**空仓库**——别勾「初始化 README」「添加 .gitignore」，那些会和仓库里已有的东西打架。然后在项目根目录：
+
+```bash
+git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+git push -u origin main
+```
+
+#### 2.2 本地先跑通（可选，但建议）
 
 ```bash
 cd relay
 npm install
-cp .env.example .env      # 改里面的 ADMIN_TOKEN
+cp .env.example .env      # 至少把 ADMIN_TOKEN 换掉
 npm start
 ```
 
-部署到 Zeabur：
+```bash
+npm test                  # 26 项冒烟测试：接口、鉴权、命名空间隔离、路径穿越全打一遍
+```
 
-1. 新建服务，选这个仓库。**这是 monorepo，记得把 Root Directory 设成 `relay`**——
-   Zeabur 会用 `relay/Dockerfile` 构建。不设的话它会在仓库根找 Dockerfile，找不到就走进自动识别，
-   结果不对（比如当成纯 Node 项目用 `npm start`，但根目录没有 `package.json`）。
+#### 2.3 部署到 Zeabur
+
+1. 新建服务，选刚推上去的仓库。**Root Directory 必须填 `relay`** —— 这是 monorepo，
+   仓库根没有 `package.json`。不填的话 Zeabur 会在仓库根找 Dockerfile，找不到就走进自动识别，
+   结果不对（比如当成纯 Node 项目跑 `npm start`，然后构建失败）。
 2. **挂持久卷**：服务页 → Volumes → 挂载目录填 `/data`。
    ⚠️ 不做这步的话，容器一重启所有备份都没了。挂载时该目录会被清空，首次部署无所谓。
-3. 配环境变量：`ADMIN_TOKEN`（自己生成一个长随机串）、`DATA_DIR=/data`、`BOOTSTRAP_NAMESPACE=A`。
+3. 配环境变量，`DATA_DIR=/data`、`BOOTSTRAP_NAMESPACE=A` 这两个是必须的，其余看下表。
 4. 部署完成后看**日志**，第一次启动会打印命名空间 `A` 的访问令牌。**只打印这一次**，立刻复制保存。
 
-> 令牌生成：`node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`
+#### 2.4 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DATA_DIR` | `./data` | 数据落盘目录。**Zeabur 上必须填 `/data`**，和挂载的卷对上 |
+| `PORT` | `8080` | 监听端口，Zeabur 自动注入，别写死 |
+| `BOOTSTRAP_NAMESPACE` | 空 | 首次启动自动创建这个命名空间，并把令牌打进日志。平台上不方便开 shell，靠它初始化 |
+| `ADMIN_TOKEN` | 空 | 管理令牌，**你自己编的**，见 2.5 |
+| `ENABLE_INVITES` | `false` | 想给朋友开命名空间才需要打开 |
+| `BOOTSTRAP_TOKEN` | 空 | 想固定引导命名空间的令牌就填这里，留空则每次随机生成 |
+
+> 生成随机串：`node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`
+
+#### 2.5 `ADMIN_TOKEN` 是什么？它和「访问令牌」不是一回事
+
+这个项目里有**两个都叫"令牌"但完全不同**的东西，这是最容易填错的地方：
+
+|  | `ADMIN_TOKEN` | 访问令牌 |
+|---|---|---|
+| 谁生成 | **你自己编一个长随机串**，填进服务端环境变量 | **中转服务生成**，首次启动打进日志，只显示一次 |
+| 存在哪 | 服务端环境变量，不落盘、谁都不发 | 服务端只存 sha256，明文丢了找不回 |
+| 给谁用 | 只有**你**，用来调 `/admin/*` 管理接口 | 填进两台酒馆扩展的「访问令牌」输入框 |
+| 能干吗 | 建命名空间、签发邀请码 | 在自己那个命名空间里读写文件 |
+| 不设会怎样 | 服务照常跑、扩展照常用，只是 `/admin/*` 返回 500 | 扩展连不上中转，必须填 |
+
+**只做两台设备自己同步的话，`ADMIN_TOKEN` 可以完全不设** —— `BOOTSTRAP_NAMESPACE=A`
+已经在首次启动时替你把命名空间建好、把令牌打出来了。需要它只有两种情况：想再建一个命名空间，
+或者要签发邀请码给别人用（见下面「给朋友用」）。
+
+⚠️ `ADMIN_TOKEN` 从头到尾**不会出现在酒馆扩展里**。扩展那个「访问令牌」框里填的是上面那张表右列的
+**访问令牌**，填错了会直接连不上。
 
 ### 3. 装扩展
 

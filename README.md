@@ -23,6 +23,9 @@
 | `extension/st-sync/` | 酒馆前端扩展，两端各装一份 |
 | `tools/probe-st-backup.md` | **上线前必跑**：探测你酒馆的真实备份接口 |
 | `tools/probe-backup-contents.md` | **上线前建议跑**：确认备份包里到底有没有密钥 |
+| `tools/tt-tavern-api.md` | TT 酒馆（Tauri 重写版）的接口速查——上传/恢复为什么要分叉，看这份 |
+| `tools/zip-reader-test/` | `node tools/zip-reader-test/run.js`：备份解包器的实测，23 份夹具 × 三条解压路径 |
+| `tools/sync-restore-test/` | `node tools/sync-restore-test/run.js`：超时与「TT 原生导入」分叉的实测 |
 
 ## 快速开始
 
@@ -30,16 +33,20 @@
 
 SillyTavern 的备份/恢复接口在不同版本间改过，猜错会表现为"上传成功但恢复没反应"这种难查的问题。
 
-**已在 SillyTavern 1.18.0（官方镜像）上实测确认，扩展里已填好，通常不用再动：**
+**下载备份**：`POST /api/users/backup`，请求体要带 `{ handle }`，不带直接 400。
+已在 SillyTavern 1.18.0（官方镜像）和 TT 酒馆上实测确认，两端一致。
 
-| 用途 | 接口 |
-|---|---|
-| 下载备份 | `POST /api/users/backup` |
-| 恢复备份 | `POST /api/backups/restore` |
+**恢复备份**没有这么一条接口——酒馆根本没提供"上传 zip 还原"。所以扩展在恢复侧分了两条路，
+启动时按 `window.__TAURITAVERN__` 有没有值自动选：
 
-> 注意：两个接口**前缀不一样**——下载在 `/api/users/` 下，恢复在 `/api/backups/` 下。历史上 `POST /api/backups/download` 这个路径在 1.18.0 返回 404，别用。
+| 跑在哪 | 怎么恢复 | 为什么 |
+|---|---|---|
+| 原版 ST（云酒馆） | 把 zip 拆开，**按类写回**，每类数据调酒馆前端自己也在用的保存接口 | 没有别的路 |
+| TT 酒馆 | `POST /api/extensions/data-migration/import` **整包导入**，后端自己拆包落盘 | TT 内置的「数据迁移」扩展直接吃原版 ST 导出的 zip，一条请求搞定 |
 
-换版本后如果失效，用 `tools/probe-st-backup.md` 重新探测一次，改 `extension/st-sync/index.js` 顶部的 `ST_API` 即可。
+分叉的依据、以及每条路由的原始出处，都写在 [`tools/tt-tavern-api.md`](tools/tt-tavern-api.md) 里。
+换酒馆版本后如果哪边失效，用 `tools/probe-st-backup.md` 重新探测，改 `extension/st-sync/index.js`
+顶部的 `ST_API` / `DM_API` 即可。
 
 ### 2. 部署中转服务
 
@@ -63,7 +70,7 @@ npm start
 ```
 
 ```bash
-npm test                  # 26 项冒烟测试：接口、鉴权、命名空间隔离、路径穿越全打一遍
+npm test                  # 34 项冒烟测试：接口、鉴权、命名空间隔离、路径穿越全打一遍
 ```
 
 #### 2.3 部署到 Zeabur
@@ -144,7 +151,7 @@ npm test                  # 26 项冒烟测试：接口、鉴权、命名空间�
 |---|---|
 | 测试连接 | 确认地址、令牌、命名空间都对 |
 | 上传到中转 | 把本机数据打包上传，**不动本机数据** |
-| 从中转恢复 | 拉对方的最新备份**覆盖本机**，会提示刷新页面 |
+| 从中转恢复 | 拉对方的最新备份**覆盖本机**，会提示刷新页面（恢复方式按平台自动选，见上） |
 | 智能同步 | 先判断两边谁改了，再决定拉还是推 |
 
 自动行为：
@@ -251,3 +258,9 @@ git push origin extension
 - 恢复后需要刷新页面，酒馆内存里还是旧数据。
 - 传输未加密（依赖 HTTPS）。中转服务本身不做端到端加密。
 - 自动上传靠浏览器定时器，只在**页面开着**时才跑。
+- 原版 ST 那条恢复路是**合并式**的：同名覆盖，**不会删掉本机多出来的角色卡和聊天**；
+  角色画廊图、向量库、扩展私有文件这三类酒馆没提供写入接口，还原不了。
+  TT 那条原生整包导入**不保证**这些——它怎么合并是酒馆后端的事，我们没读到结论，
+  所以扩展里也没敢写这种承诺（见 `tools/tt-tavern-api.md` 第 6 节）。
+- 所有请求都有超时（中转/酒馆 60s，打包下载 180s）。超时是必需的：TT 手机端上读
+  `POST /api/users/backup` 那个大流时 fetch 可能永远不返回，没有超时整个扩展会卡死。

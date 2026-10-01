@@ -204,3 +204,40 @@ GET /api/extensions/data-migration/job?id=<job_id>
 **不用再查的方向**：超时值不够（不是）、WebView 消费流不 settle（不是）。§5 里 `hang-body` 那个用例复现的是另一种形态，与本 bug 无关。
 
 用户是在**手机上装扩展**测试的，那里没有任何控制台——**以后这个项目所有诊断都必须落在面板 UI 里**，`console.*` 只能当附带。
+
+## 8. 上传侧绕行方案：逐类读 + 客户端拼 zip（进行中，2026-10-01 定）
+
+`/api/users/backup` 在 iOS 上走不通（§3.3），所以上传侧改用**酒馆自己的逐类读接口**把数据读回来、客户端拼一个 zip 再 PUT 到 relay。**云侧（原版 ST）的 `restoreFromZip` 一行不用改**，协议和中转里已有快照都保持兼容。
+
+### TT 的读接口（**全部是 POST**，和原版 ST 的 GET 不一样）
+
+出处 `src/tauri/main/routes/*.js`：
+
+| 类 | 读接口 | 状态 |
+|---|---|---|
+| settings | `POST /api/settings/get` | ✅ |
+| characters | `POST /api/characters/all`（列表）+ `POST /api/characters/export`（body `{avatar_url, format:'png'\|'json'}` → **原始字节** Response） | ✅ 可字节保真 |
+| chats | `POST /api/characters/chats`（列某角色的聊天）+ `POST /api/chats/get`（取消息） | ✅ |
+| group chats | `POST /api/chats/group/info` + `POST /api/chats/group/get` | ✅ |
+| groups | `POST /api/groups/all` + `POST /api/groups/get` | ✅ |
+| worlds | `POST /api/worldinfo/get` + `POST /api/worldinfo/get-batch` | ✅ |
+| backgrounds | `POST /api/backgrounds/all`（字节返回方式待确认） | ⚠️ |
+| avatars | `POST /api/avatars/get`（同上） | ⚠️ |
+| images | 只有 `POST /api/images/list`，**没有取字节的接口** | ❌ |
+| files | **完全没有读接口**（只有 upload/delete/verify） | ❌ |
+| presets | 只有 save/delete/restore，**没有 list** | ❌ |
+| themes | 只有 save/delete | ❌ |
+| quick-replies | 只有 save/delete | ❌ |
+| movingUI | 没找到 | ❌ |
+
+❌ 的那几类在 TT 上**读不出来**，v1 直接跳过并在面板日志里标注（用户已同意「尽力而为」）。
+
+### 拼 zip 的关键约束（从云侧 restore 反推，别踩）
+
+- 扁平布局（**没有** `user/data/default-user/` 前缀，根目录直接是 `characters/`、`settings.json`…），规格来源 = `classifyRestoreEntry` + `RESTORE_ORDER` + `PRESET_DIRECTORIES` + `RESTORE_SKIP_PREFIXES`。
+- 聊天必须是 **JSONL**（每行一个 message），云侧 `stParseJsonl` 读回。
+- **角色卡导出成 `.png`**，且 `characters/<card>.png` 与 `chats/<card>/` 的 `<card>` 必须一致 —— 云侧 `writeChat` 靠 `avatar_url` 反解角色名。用 `/api/characters/all` 给的 `avatar` 真名，别用显示名。
+- **secrets 跳过**，对齐 ST 默认的 exclude 行为。
+- 现有 `ZipReader` 只有读（inflate），**没有 zip writer** —— 需要新增一个 store-only（method 0）的写出口。
+
+**详细实施计划在 `C:\Users\sekiya\.claude\plans\declarative-spinning-kettle.md`**（换窗后从那里接，本文件只记结论）。

@@ -83,6 +83,44 @@
 | 从中转恢复 | 拉对方的最新备份**覆盖本机**，会提示刷新页面 |
 | 智能同步 | 先判断两边谁改了，再决定拉还是推 |
 
+## 恢复是怎么做的（按平台自动分叉）
+
+恢复**没有**一条通用的"上传 zip 还原"接口可用，所以扩展在启动时按
+`window.__TAURITAVERN__` 有没有值决定走哪条路：
+
+| 跑在哪 | 怎么恢复 |
+|---|---|
+| 原版 ST（云酒馆） | 把 zip 拆开**按类写回**：每类数据调酒馆前端自己也在用的保存接口，几百个请求，逐个记进度（iOS 上被杀掉能接着写） |
+| TT 酒馆 | `POST /api/extensions/data-migration/import` **整包导入**：把 zip 丢给 TT 内置的「数据迁移」扩展，后端自己拆包落盘，一条请求搞定 |
+
+两条路的**合并语义不一样**，扩展里的说明文案也是分开写的：
+
+- 按类写回是合并式的——同名覆盖，**不会删掉本机多出来的角色卡和聊天**；
+- 原生整包导入是酒馆后端说了算，我们没读到它到底怎么合并，所以**不做任何承诺**。
+
+分叉依据和每条路由的原始出处见
+[`tools/tt-tavern-api.md`](https://github.com/Akano-722/TT-ST-Data/blob/main/tools/tt-tavern-api.md)。
+
+### 所有请求都有超时
+
+中转/酒馆 60 秒，打包下载 180 秒（服务端要先把自己几百 MB 数据打成 zip 才开始回包）。
+
+这不是防御性编程：TT 手机端上消费 `POST /api/users/backup` 那个带
+`Content-Disposition: attachment` 的大二进制流时，fetch 可能**永远不返回**。
+没有超时的话 `busy` 标记会永远挂着，状态栏停在"正在同步"，之后点什么都只回"正在忙"——
+看起来就是整个扩展死了。有超时，最坏也只是这一次同步失败。
+
+超时是 `timedFetch` 统一实现的（AbortController，不是 `Promise.race`——后者只是不等了，
+连接还挂在后台）。它记三个时间点，出问题时在控制台能看到卡在哪一步：
+
+```
+[ST-Sync] 酒馆生成备份 发出（超时 180s）：/api/users/backup
+[ST-Sync] 酒馆生成备份 响应头到达：HTTP 200，用时 120ms
+[ST-Sync] 酒馆生成备份 body 读完，总共 8432ms
+```
+
+**只有前两行、没有第三行**，就是踩中上面那个坑了。
+
 ## 自动行为
 
 - **打开页面时**（默认开）：判断对面的备份有没有更新——有就拉，本机有改动就推，
@@ -114,27 +152,28 @@ location.reload();
 | 现象 | 多半是 |
 |---|---|
 | 测试连接失败 | 地址写错、服务没跑、被浏览器跨域拦住（看控制台具体报错） |
-| 「上传成功但恢复没反应」 | 酒馆的备份/恢复接口路径和扩展里写死的不一致，见下 |
-| 点了同步没反应 | 两台设备的**本机标识填成一样了** |
+| 「上传成功但恢复没反应」 | 酒馆的备份/导入接口路径和扩展里写死的不一致，见下 |
+| 点了同步没反应 | 两台设备的**本机标识填成一样了**，或者上一步卡在超时上了（看控制台有没有"超时"） |
 | 恢复后界面没变化 | 正常，恢复是覆盖磁盘数据，必须刷新页面才生效 |
+| 状态栏一直"正在同步" | 旧版本没有超时会这样；现在最迟 3 分钟一定会退出来并报错 |
 
-扩展顶部的 `ST_API` 写死了酒馆的备份接口路径：
+扩展顶部写死了两组接口路径：
 
 ```js
-const ST_API = {
-    download: { method: 'POST', url: '/api/users/backup' },
-    restore:  { method: 'POST', url: '/api/backups/restore' },
-};
+const ST_API = { download: { method: 'POST', url: '/api/users/backup' }, /* …按类写回用的一堆 */ };
+const DM_API = { import: '/api/extensions/data-migration/import', job: '/api/extensions/data-migration/job' };
 ```
 
-**这两个接口在两个不同前缀下**（下载在 `/api/users/`，恢复在 `/api/backups/`），
-别被路径前缀误导。已在 SillyTavern 1.18.0 官方镜像上实测确认。
+- `ST_API.download` 是下载整份备份，**请求体必须带 `{ handle }`**，不带直接 400。
+  已在 SillyTavern 1.18.0 官方镜像和 TT 酒馆上实测确认。
+- `DM_API` 是 TT 酒馆内置「数据迁移」扩展的导入路由，**只有 TT 有**。
+  出处：TT 源码 `src/tauri/main/routes/extensions-routes.js`。
+- 其余 `/api/characters/import`、`/api/chats/save` 之类是原版 ST 上按类写回用的，
+  逐个在 1.18.0 源码里核对过，出处写在 `index.js` 对应的 `writeXxx` 函数旁边。
+
 换酒馆版本后如果失效，用
 [`tools/probe-st-backup.md`](https://github.com/Akano-722/TT-ST-Data/blob/main/tools/probe-st-backup.md)
-重新探测，改这里即可。
-
-恢复接口的 multipart 字段名在各版本间变过，扩展会按 `backup` → `file` → `upload` → `avatar`
-的顺序试，第一个成功的记进设置的 `restoreField`，之后直接用。所以**第一次恢复可能慢一点**，正常。
+重新探测 ST 那侧，TT 那侧对着 [`tools/tt-tavern-api.md`](https://github.com/Akano-722/TT-ST-Data/blob/main/tools/tt-tavern-api.md) 核对。
 
 ## 已知限制
 
@@ -142,3 +181,6 @@ const ST_API = {
 - 恢复后需要刷新页面，酒馆内存里还是旧数据。
 - 自动上传靠浏览器定时器，**只在页面开着时才跑**；iOS 上 App 被系统杀掉后就不跑了。
 - 令牌以明文存在 localStorage 里，能访问你浏览器的人就能拿走它。
+- 按类写回（原版 ST 那条路）**不会删掉本机多出来的角色卡和聊天**；但 TT 的原生整包导入
+  怎么合并我们不知道，没做承诺。
+- 原生整包导入的进度在酒馆后端，**进程被杀就没了**，不能像按类写回那样接着上次写。

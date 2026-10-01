@@ -13,27 +13,38 @@
 const LOG = '[ST-Sync]';
 
 /* ------------------------------------------------------------------ *
- * 已实测确认（SillyTavern 1.18.0，官方镜像 ghcr.io/sillytavern/sillytavern）：
- *   下载备份  POST /api/users/backup      —— 注意不是 /api/backups/download，那是旧路径
- *             请求体必须带 { handle }，不带就是 400（见 currentHandle 的注释）
- *   当前用户  GET  /api/users/me          —— 用来取上面那个 handle
- * 换版本后若失效，用 tools/probe-st-backup.md 重新探测。
+ * 酒馆接口清单（都在 1.18.0 源码里逐个核对过，出处写在对应实现旁边）
  *
- * ⚠️ 恢复备份（ST_API.restore）在 1.18.0 的源码里查无此路由：酒馆前端只能下载备份，
- *    从来没有"上传备份还原"的接口。这条路径是坏的，见 README「已知限制」。
+ * 上传这一侧只有两个：
+ *   POST /api/users/backup   下载整份备份。请求体必须带 { handle }，不带就是 400
+ *                            （users-private.js:146 读的正是 request.body.handle）
+ *   GET  /api/users/me       取当前用户的 handle
+ *
+ * 恢复这一侧**没有**"上传 zip 还原"的接口 —— 1.18.0 里根本不存在这种路由
+ * （/api/backups 下只有 chat/get、chat/delete、chat/download 三条，那是聊天记录备份，
+ * 跟用户数据备份是两码事）。所以恢复改成了**按类写回**：把 zip 拆开，
+ * 每一类数据用酒馆前端自己也在用的"保存"接口写回去，见下面的 RESTORE_KINDS。
  * ------------------------------------------------------------------ */
 const ST_API = {
     download: { method: 'POST', url: '/api/users/backup' },
-    restore: { method: 'POST', url: '/api/backups/restore' },
     me: { method: 'GET', url: '/api/users/me' },
-};
 
-/**
- * 恢复接口的 multipart 字段名在各版本间变过，猜错会返回 400。
- * 与其写死一个值然后让用户对着 400 干瞪眼，不如按顺序试，
- * 第一个成功的记进设置，之后就直接用它。
- */
-const RESTORE_FIELD_CANDIDATES = ['backup', 'file', 'upload', 'avatar'];
+    // —— 恢复时用到的写入接口 ——
+    characterImport: '/api/characters/import',
+    chatSave: '/api/chats/save',
+    groupChatSave: '/api/chats/group/save',
+    groupEdit: '/api/groups/edit',
+    worldImport: '/api/worldinfo/import',
+    themeSave: '/api/themes/save',
+    presetSave: '/api/presets/save',
+    quickReplySave: '/api/quick-replies/save',
+    movingUiSave: '/api/moving-ui/save',
+    backgroundUpload: '/api/backgrounds/upload',
+    avatarUpload: '/api/avatars/upload',
+    imageUpload: '/api/images/upload',
+    fileUpload: '/api/files/upload',
+    settingsSave: '/api/settings/save',
+};
 
 const DEFAULT_SETTINGS = {
     relayUrl: '',          // 中转服务地址，例如 https://sync.example.com
@@ -46,8 +57,11 @@ const DEFAULT_SETTINGS = {
     checkOnLoad: true,     // 打开页面时自动检查中转有没有更新的备份
     conflictPolicy: 'ask', // ask | newest | skip
     keepSnapshots: 5,      // 中转上为每台设备保留多少个历史快照
-    restoreField: '',      // 恢复接口实测可用的字段名，自动探测一次后记住
     lastPulled: {},        // { 设备id: 已拉取过的版本标记 }，用于判断"对方有没有变"
+
+    // 恢复进度。一次恢复是几百个请求，iOS 上随时可能被杀掉，所以每写完一个文件
+    // 就落盘一次，下次接着写，不用从头再来（见 restoreFromZip）。
+    restoreProgress: null, // { marker: <这份备份的标识>, done: [路径…] }
 
     // 下面两个是运行状态，但必须落盘（见 markDirty 的注释）
     localDirty: false,     // 本机自上轮同步后有没有改动
@@ -60,6 +74,7 @@ const STATE = {
     lastResult: '',
     lastOk: null,
     suppressDirty: false, // 恢复数据期间挂起改动检测，避免把恢复本身误判成用户改动
+    restore: null,        // 恢复进行中时是 { label, done, total }，用来在状态栏显示进度
 };
 
 let ui = {};
@@ -164,7 +179,10 @@ function notify(kind, message) {
 function renderStatus() {
     if (!ui.status) return;
     const parts = [];
-    if (STATE.busy) parts.push('⏳ 正在同步…');
+    if (STATE.restore) {
+        // 恢复是几百个请求，得让人看见它在往前走，不然会以为卡死了
+        parts.push(`⏳ 正在还原：${STATE.restore.label}　${STATE.restore.done}/${STATE.restore.total}`);
+    } else if (STATE.busy) parts.push('⏳ 正在同步…');
     else if (STATE.lastResult) parts.push(STATE.lastResult);
 
     const s = settings();
@@ -313,59 +331,804 @@ async function buildLocalBackup() {
     return blob;
 }
 
-/** 发一次恢复请求，把结果原样回报，是否重试交给调用方判断 */
-async function postRestore(blob, fileName, fieldName) {
-    const headers = { ...ctx().getRequestHeaders() };
-    // getRequestHeaders() 里带着 Content-Type: application/json，
-    // 直接拿来发 FormData 会让浏览器无法自动补 multipart 的 boundary，服务端就解析不出文件。
-    delete headers['Content-Type'];
-    delete headers['content-type'];
+/* ==================================================================== *
+ * 浏览器端 zip 解包
+ *
+ * 为什么不用现成的库：这个文件一条 import 都不能有（见文件头），而且备份包动辄
+ * 几百 MB，整包读进内存会让 iOS 的 WebView 直接崩。所以下面按需切片：
+ * 只先把中央目录读出来，之后每读一个文件才 slice 一次 —— 内存里同时
+ * 只有"当前这个文件"那么大。
+ * ==================================================================== */
+// ==== ZIP-READER-BEGIN ====
 
-    const form = new FormData();
-    form.append(fieldName, blob, fileName || 'backup.zip');
+const ZIP_SIG_EOCD = 0x06054b50;
+const ZIP_SIG_EOCD64 = 0x06064b50;
+const ZIP_SIG_EOCD64_LOCATOR = 0x07064b50;
+const ZIP_SIG_CENTRAL = 0x02014b50;
+const ZIP_SIG_LOCAL = 0x04034b50;
 
-    const res = await fetch(ST_API.restore.url, {
-        method: ST_API.restore.method,
-        headers,
-        body: form,
-    });
-    if (res.ok) return { ok: true, status: res.status };
+/** zip 的注释最长 65535 字节，所以中央目录结尾一定落在末尾这么多个字节里 */
+const ZIP_MAX_COMMENT = 0xffff;
 
-    const text = await res.text().catch(() => '');
-    return { ok: false, status: res.status, text: text.slice(0, 200) };
+const DEFLATE_LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const DEFLATE_LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DEFLATE_DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DEFLATE_DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+/** 动态 Huffman 里"码长"那棵树的码长按这个顺序排放，不是按数值顺序 */
+const DEFLATE_CODELEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+function zipU16(view, offset) {
+    return view.getUint16(offset, true);
 }
 
-async function restoreFromBlob(blob, fileName) {
-    const s = settings();
-    const candidates = [];
-    if (s.restoreField) candidates.push(s.restoreField);
-    for (const name of RESTORE_FIELD_CANDIDATES) {
-        if (!candidates.includes(name)) candidates.push(name);
-    }
+function zipU32(view, offset) {
+    return view.getUint32(offset, true);
+}
 
-    let last = null;
-    for (const field of candidates) {
-        const result = await postRestore(blob, fileName, field);
-        if (result.ok) {
-            if (s.restoreField !== field) {
-                s.restoreField = field;
-                persist();
-                console.debug(LOG, `恢复接口的字段名确认为 "${field}"，已记住`);
+/**
+ * zip 规范里文件名要么是 UTF-8（置了 bit 11），要么是 CP437。
+ * archiver 对非 ASCII 名字会置 bit 11 写 UTF-8，但别的打包器可能不置、直接写本地编码，
+ * 中文名就会变成乱码。所以 UTF-8 解出替换字符时，再用 GBK 试一次。
+ */
+function decodeZipName(bytes) {
+    const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    if (!utf8.includes('�')) return utf8;
+    try {
+        const gbk = new TextDecoder('gbk').decode(bytes);
+        return gbk.includes('�') ? utf8 : gbk;
+    } catch {
+        return utf8;
+    }
+}
+
+/* ---------------- 纯 JS 的 DEFLATE 解压 ---------------- */
+
+function makeBitReader(input) {
+    let pos = 0;
+    let buf = 0;
+    let count = 0;
+    return {
+        bit() {
+            if (count === 0) {
+                if (pos >= input.length) throw new Error('压缩数据提前结束');
+                buf = input[pos];
+                pos += 1;
+                count = 8;
             }
-            return true;
+            const value = buf & 1;
+            buf >>= 1;
+            count -= 1;
+            return value;
+        },
+        bits(n) {
+            let value = 0;
+            for (let i = 0; i < n; i += 1) value |= this.bit() << i;
+            return value;
+        },
+        align() {
+            count = 0;
+        },
+        alignedByte() {
+            if (count !== 0) throw new Error('内部错误：按字节读之前没有对齐');
+            if (pos >= input.length) throw new Error('压缩数据提前结束');
+            const value = input[pos];
+            pos += 1;
+            return value;
+        },
+    };
+}
+
+/** 按 DEFLATE 的规范构造一棵 Huffman 解码表（就是 zlib 里 puff 那套） */
+function huffmanFromLengths(lengths) {
+    const counts = new Int32Array(16);
+    for (let i = 0; i < lengths.length; i += 1) counts[lengths[i]] += 1;
+    counts[0] = 0;
+
+    const offsets = new Int32Array(16);
+    for (let i = 1; i < 16; i += 1) offsets[i] = offsets[i - 1] + counts[i - 1];
+
+    const symbols = new Int32Array(lengths.length);
+    for (let sym = 0; sym < lengths.length; sym += 1) {
+        const len = lengths[sym];
+        if (len) {
+            symbols[offsets[len]] = sym;
+            offsets[len] += 1;
         }
-        last = result;
-        // 400 多半就是字段名不对，换下一个继续试；
-        // 其它状态码（401 未登录、500 服务端炸了）换字段名也救不回来，直接停。
-        if (result.status !== 400) break;
-        console.debug(LOG, `恢复字段名 "${field}" 试失败（HTTP ${result.status}），换下一个`);
+    }
+    return { counts, symbols };
+}
+
+function decodeHuffman(bits, huffman) {
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    for (let len = 1; len <= 15; len += 1) {
+        code |= bits.bit();
+        const count = huffman.counts[len];
+        if (code - first < count) return huffman.symbols[index + (code - first)];
+        index += count;
+        first = (first + count) << 1;
+        code <<= 1;
+    }
+    throw new Error('压缩数据里的 Huffman 码无效');
+}
+
+let fixedHuffman = null;
+
+function buildFixedHuffman() {
+    const lit = new Uint8Array(288);
+    for (let i = 0; i < 144; i += 1) lit[i] = 8;
+    for (let i = 144; i < 256; i += 1) lit[i] = 9;
+    for (let i = 256; i < 280; i += 1) lit[i] = 7;
+    for (let i = 280; i < 288; i += 1) lit[i] = 8;
+    const dist = new Uint8Array(30).fill(5);
+    return { lit: huffmanFromLengths(lit), dist: huffmanFromLengths(dist) };
+}
+
+function readDynamicHuffman(bits) {
+    const litCount = bits.bits(5) + 257;
+    const distCount = bits.bits(5) + 1;
+    const codeLenCount = bits.bits(4) + 4;
+
+    const codeLenLengths = new Uint8Array(19);
+    for (let i = 0; i < codeLenCount; i += 1) codeLenLengths[DEFLATE_CODELEN_ORDER[i]] = bits.bits(3);
+    const codeLenHuffman = huffmanFromLengths(codeLenLengths);
+
+    const lengths = new Uint8Array(litCount + distCount);
+    let i = 0;
+    while (i < lengths.length) {
+        const sym = decodeHuffman(bits, codeLenHuffman);
+        if (sym < 16) {
+            lengths[i] = sym;
+            i += 1;
+            continue;
+        }
+        let repeat = 0;
+        let value = 0;
+        if (sym === 16) {
+            if (i === 0) throw new Error('压缩数据里第一个码长就是"重复上一个"');
+            value = lengths[i - 1];
+            repeat = 3 + bits.bits(2);
+        } else if (sym === 17) {
+            repeat = 3 + bits.bits(3);
+        } else {
+            repeat = 11 + bits.bits(7);
+        }
+        if (i + repeat > lengths.length) throw new Error('重复的码长超过了声明的数量');
+        for (let k = 0; k < repeat; k += 1) {
+            lengths[i] = value;
+            i += 1;
+        }
     }
 
-    throw new Error(
-        `恢复失败 HTTP ${last ? last.status : '?'}：${last ? last.text : '无响应'}。` +
-        `已试过的字段名：${candidates.join(', ')}。` +
-        `若持续失败，用 tools/probe-st-backup.md 重新确认接口`,
-    );
+    return {
+        lit: huffmanFromLengths(lengths.subarray(0, litCount)),
+        dist: huffmanFromLengths(lengths.subarray(litCount)),
+    };
+}
+
+/**
+ * 解一段 raw deflate。
+ *
+ * 只在浏览器没有 DecompressionStream 时才会走到这里（iOS 上要 16.4 以上才有）。
+ * expectedSize 是 zip 中央目录里记的原大小，有它就能一次性开好缓冲区 ——
+ * 既省掉反复扩容，也能当场发现解压结果不对。
+ */
+function inflateRawJs(input, expectedSize) {
+    const bits = makeBitReader(input);
+    let out = new Uint8Array(expectedSize > 0 ? expectedSize : 1 << 16);
+    let len = 0;
+
+    const ensure = (need) => {
+        if (len + need <= out.length) return;
+        if (expectedSize > 0) throw new Error('解压出来的数据比 zip 里声明的还大，文件可能损坏');
+        let size = out.length * 2;
+        while (size < len + need) size *= 2;
+        const bigger = new Uint8Array(size);
+        bigger.set(out.subarray(0, len));
+        out = bigger;
+    };
+
+    for (;;) {
+        const isLast = bits.bit();
+        const type = bits.bits(2);
+
+        if (type === 0) {
+            // 未压缩块：先对齐到字节边界，再读长度（含反码校验）
+            bits.align();
+            const size = bits.alignedByte() | (bits.alignedByte() << 8);
+            const inverse = bits.alignedByte() | (bits.alignedByte() << 8);
+            if (size !== (inverse ^ 0xffff)) throw new Error('未压缩块的长度校验失败，文件可能损坏');
+            ensure(size);
+            for (let i = 0; i < size; i += 1) {
+                out[len] = bits.alignedByte();
+                len += 1;
+            }
+        } else if (type === 1 || type === 2) {
+            if (!fixedHuffman) fixedHuffman = buildFixedHuffman();
+            const huffman = type === 1 ? fixedHuffman : readDynamicHuffman(bits);
+
+            for (;;) {
+                const sym = decodeHuffman(bits, huffman.lit);
+                if (sym < 256) {
+                    ensure(1);
+                    out[len] = sym;
+                    len += 1;
+                    continue;
+                }
+                if (sym === 256) break;
+
+                const lenIndex = sym - 257;
+                if (lenIndex >= DEFLATE_LEN_BASE.length) throw new Error('压缩数据里的长度码超出范围');
+                const copyLen = DEFLATE_LEN_BASE[lenIndex] + bits.bits(DEFLATE_LEN_EXTRA[lenIndex]);
+
+                const distSym = decodeHuffman(bits, huffman.dist);
+                if (distSym >= DEFLATE_DIST_BASE.length) throw new Error('压缩数据里的距离码超出范围');
+                const distance = DEFLATE_DIST_BASE[distSym] + bits.bits(DEFLATE_DIST_EXTRA[distSym]);
+                if (distance > len) throw new Error('回溯距离超出了已经解出的数据，文件可能损坏');
+
+                ensure(copyLen);
+                // 必须逐字节拷：源和目标是重叠的，这就是 deflate 表达重复内容的方式
+                for (let i = 0; i < copyLen; i += 1) {
+                    out[len] = out[len - distance];
+                    len += 1;
+                }
+            }
+        } else {
+            throw new Error('压缩数据里有非法的块类型');
+        }
+
+        if (isLast) break;
+    }
+
+    return out.subarray(0, len);
+}
+
+/** 优先用浏览器原生解压，没有（或失败）就退回上面那份纯 JS 实现 */
+async function inflateRaw(bytes, expectedSize) {
+    if (typeof DecompressionStream === 'function') {
+        try {
+            const stream = new Response(bytes).body.pipeThrough(new DecompressionStream('deflate-raw'));
+            return new Uint8Array(await new Response(stream).arrayBuffer());
+        } catch (err) {
+            console.warn(LOG, '浏览器原生解压失败，改用内置解压', err);
+        }
+    }
+    return inflateRawJs(bytes, expectedSize);
+}
+
+/* ---------------- zip 读取器 ---------------- */
+
+class ZipReader {
+    constructor(blob) {
+        this.blob = blob;
+        this.entries = [];
+    }
+
+    /** 从尾部倒着找中央目录结尾，再看要不要读 Zip64 记录，最后把中央目录整段解出来 */
+    async parse() {
+        const tailLength = Math.min(this.blob.size, ZIP_MAX_COMMENT + 22);
+        const tailStart = this.blob.size - tailLength;
+        const tail = new DataView(await this.blob.slice(tailStart).arrayBuffer());
+
+        let eocdAt = -1;
+        for (let i = tail.byteLength - 22; i >= 0; i -= 1) {
+            if (zipU32(tail, i) !== ZIP_SIG_EOCD) continue;
+
+            // 光认出这 4 个字节不够：zip 注释里可能就带着 PK\x05\x06，
+            // 而注释排在真 EOCD 后面，从尾往前扫会先撞上它，把注释字节当成目录长度、
+            // 目录偏移读，最后整个包被判成损坏。判据是：真 EOCD 后面跟的注释长度
+            // 正好顶到文件末尾。对不上就继续往前找，别停在这个假货上。
+            // （Python 的 zipfile 就栽在这里，它源码里明写了"假设注释不含这个魔数"，
+            //   而这份假设在 1.18.0 上不成立 —— 见 tools/zip-reader-test/。）
+            if (tailStart + i + 22 + zipU16(tail, i + 20) === this.blob.size) {
+                eocdAt = i;
+                break;
+            }
+        }
+        if (eocdAt < 0) throw new Error('这不是一个 zip 文件（找不到中央目录结尾）');
+
+        let total = zipU16(tail, eocdAt + 10);
+        let centralSize = zipU32(tail, eocdAt + 12);
+        let centralOffset = zipU32(tail, eocdAt + 16);
+
+        // 条目数或偏移溢出时（>65535 个文件 / >4GB），真值在 Zip64 记录里
+        if (total === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+            const zip64 = await this.readZip64(tailStart + eocdAt);
+            if (zip64) {
+                total = zip64.total;
+                centralSize = zip64.centralSize;
+                centralOffset = zip64.centralOffset;
+            }
+        }
+
+        if (centralOffset + centralSize > this.blob.size) {
+            throw new Error('备份文件不完整（中央目录超出了文件末尾）');
+        }
+
+        const central = new DataView(
+            await this.blob.slice(centralOffset, centralOffset + centralSize).arrayBuffer(),
+        );
+
+        let p = 0;
+        for (let i = 0; i < total; i += 1) {
+            // 尾部有脏数据就停在这儿，已经解析出来的照用，别为几个坏条目把整包丢掉
+            if (p + 46 > central.byteLength || zipU32(central, p) !== ZIP_SIG_CENTRAL) {
+                console.warn(LOG, `中央目录在第 ${i} 条中断，已解析 ${this.entries.length} 条`);
+                break;
+            }
+
+            const method = zipU16(central, p + 10);
+            let compSize = zipU32(central, p + 20);
+            let uncompSize = zipU32(central, p + 24);
+            const nameLength = zipU16(central, p + 28);
+            const extraLength = zipU16(central, p + 30);
+            const commentLength = zipU16(central, p + 32);
+            let localOffset = zipU32(central, p + 42);
+
+            const nameBytes = new Uint8Array(central.buffer, central.byteOffset + p + 46, nameLength);
+
+            // Zip64：哪个字段是 0xFFFFFFFF，扩展区里就按顺序补哪个 8 字节值
+            if (uncompSize === 0xffffffff || compSize === 0xffffffff || localOffset === 0xffffffff) {
+                let ep = p + 46 + nameLength;
+                const extraEnd = ep + extraLength;
+                while (ep + 4 <= extraEnd) {
+                    const headerId = zipU16(central, ep);
+                    const dataSize = zipU16(central, ep + 2);
+                    if (headerId === 0x0001) {
+                        let dp = ep + 4;
+                        const take = () => {
+                            const value = Number(central.getBigUint64(dp, true));
+                            dp += 8;
+                            return value;
+                        };
+                        if (uncompSize === 0xffffffff) uncompSize = take();
+                        if (compSize === 0xffffffff) compSize = take();
+                        if (localOffset === 0xffffffff) localOffset = take();
+                        break;
+                    }
+                    ep += 4 + dataSize;
+                }
+            }
+
+            this.entries.push({
+                name: decodeZipName(nameBytes),
+                method,
+                compSize,
+                uncompSize,
+                offset: localOffset,
+            });
+
+            p += 46 + nameLength + extraLength + commentLength;
+        }
+
+        return this.entries;
+    }
+
+    async readZip64(eocdAbs) {
+        const locatorAt = eocdAbs - 20;
+        if (locatorAt < 0) return null;
+
+        const locator = new DataView(await this.blob.slice(locatorAt, locatorAt + 20).arrayBuffer());
+        if (zipU32(locator, 0) !== ZIP_SIG_EOCD64_LOCATOR) return null;
+
+        const recordAt = Number(locator.getBigUint64(8, true));
+        if (recordAt + 56 > this.blob.size) return null;
+
+        const record = new DataView(await this.blob.slice(recordAt, recordAt + 56).arrayBuffer());
+        if (zipU32(record, 0) !== ZIP_SIG_EOCD64) return null;
+
+        return {
+            total: Number(record.getBigUint64(32, true)),
+            centralSize: Number(record.getBigUint64(40, true)),
+            centralOffset: Number(record.getBigUint64(48, true)),
+        };
+    }
+
+    /** 只读这一个文件的字节：按中央目录记的偏移切出来，再按需解压 */
+    async readBytes(entry) {
+        const head = new DataView(await this.blob.slice(entry.offset, entry.offset + 30).arrayBuffer());
+        if (zipU32(head, 0) !== ZIP_SIG_LOCAL) {
+            throw new Error(`中央目录指向的位置不是文件头：${entry.name}`);
+        }
+        const nameLength = zipU16(head, 26);
+        const extraLength = zipU16(head, 28);
+        const start = entry.offset + 30 + nameLength + extraLength;
+
+        const raw = new Uint8Array(await this.blob.slice(start, start + entry.compSize).arrayBuffer());
+        if (entry.method === 0) return raw;
+        if (entry.method === 8) return await inflateRaw(raw, entry.uncompSize);
+        throw new Error(`zip 用了不支持的压缩方式 ${entry.method}：${entry.name}`);
+    }
+
+    async readText(entry) {
+        return new TextDecoder('utf-8').decode(await this.readBytes(entry));
+    }
+
+    async readBlob(entry, mime = 'application/octet-stream') {
+        return new Blob([await this.readBytes(entry)], { type: mime });
+    }
+}
+
+// ==== ZIP-READER-END ====
+
+/* ==================================================================== *
+ * 恢复：把备份拆开，按类用酒馆自己的"保存"接口写回去
+ *
+ * 有两个地方必须在脑子里记住：
+ *  1. 这是**合并式还原**，只覆盖同名文件，不删除本机多出来的东西。
+ *     全量接口本来就不提供"删掉备份里没有的"，所以别指望它把本机清成对面的样子。
+ *  2. 顺序不能乱：聊天记录是按"角色卡文件名"分目录存的，
+ *     所以角色卡必须先落地，否则聊天会全部对不上号。settings.json 放最后。
+ * ==================================================================== */
+
+/** 酒馆接口的通用调用。multipart 时不能带 Content-Type，否则浏览器补不上 boundary。 */
+async function stFetch(url, { json, multipart } = {}) {
+    const headers = { ...ctx().getRequestHeaders() };
+    let body;
+    if (multipart) {
+        delete headers['Content-Type'];
+        delete headers['content-type'];
+        body = multipart;
+    } else if (json !== undefined) {
+        body = JSON.stringify(json);
+    }
+    return fetch(url, { method: 'POST', headers, body });
+}
+
+/**
+ * 检查酒馆的响应。
+ * 注意 `/api/characters/import` 出错时**HTTP 状态码仍然是 200**，只在 body 里放
+ * `{ error: true }`（characters.js:1595），所以光看 res.ok 会把失败当成功。
+ */
+async function stMustOk(res, what) {
+    const text = await res.text().catch(() => '');
+    let json = null;
+    if (text) {
+        try {
+            json = JSON.parse(text);
+        } catch {
+            // 有些接口（背景图上传）成功时回的是纯文本文件名，不是 JSON
+        }
+    }
+
+    if (!res.ok) {
+        throw new Error(`HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`);
+    }
+    if (json && json.error) {
+        throw new Error(`酒馆拒绝了这次请求：${JSON.stringify(json).slice(0, 200)}`);
+    }
+    return { json, text };
+}
+
+function stParseJson(text, what) {
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        throw new Error(`${what} 不是合法的 JSON：${err.message}`);
+    }
+}
+
+/** jsonl → 消息数组。酒馆写盘时是一行一个 JSON，读回来要还原成数组。 */
+function stParseJsonl(text) {
+    const messages = [];
+    let broken = 0;
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+            messages.push(JSON.parse(trimmed));
+        } catch {
+            // 单行坏掉就跳过它，把剩下的救回来，最后统计一次报告出去
+            broken += 1;
+        }
+    }
+    return { messages, broken };
+}
+
+function base64FromBytes(bytes) {
+    let binary = '';
+    const chunk = 0x8000; // 分块拼字符串，绕开 apply 的参数个数上限
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+}
+
+/** assets/ 和 extensions/ 之类没有写入接口的目录会被跳过，这里也顺带挡掉打包工具的垃圾 */
+const RESTORE_SKIP_PREFIXES = [
+    'thumbnails/',  // 纯缩略图缓存，删了酒馆会自己重建
+    'vectors/',     // 向量库，重建要重跑 embedding，代价太大
+    'backups/',     // 酒馆自己产生的快照
+    'extensions/',  // 扩展私有文件，没有写入口
+    'assets/',      // 角色画廊/贴纸，酒馆只提供了读和删的接口，没有写
+    'user/workflows/', // ComfyUI 工作流，没有写入口
+    '__MACOSX/',    // 打包工具塞进来的垃圾
+];
+
+/** 预设是分散在好几个目录里的，接口靠 apiId 区分往哪个目录写（presets.js:16-38） */
+const PRESET_DIRECTORIES = {
+    'OpenAI Settings': 'openai',
+    'TextGen Settings': 'textgenerationwebui',
+    'KoboldAI Settings': 'kobold',
+    'NovelAI Settings': 'novel',
+    'instruct': 'instruct',
+    'context': 'context',
+    'sysprompt': 'sysprompt',
+    'reasoning': 'reasoning',
+};
+
+const RESTORE_ORDER = [
+    'character', 'world', 'group', 'chat', 'groupChat',
+    'theme', 'preset', 'quickReply', 'movingUI',
+    'background', 'userAvatar', 'userImage', 'userFile',
+    'settings', // 放最后：它引用了前面那些东西（头像、角色卡、预设名）
+];
+
+const RESTORE_LABELS = {
+    character: '角色卡', world: '世界书', group: '群组', chat: '聊天记录',
+    groupChat: '群聊记录', theme: '主题', preset: '预设', quickReply: '快捷回复',
+    movingUI: '界面布局', background: '背景图', userAvatar: '用户头像',
+    userImage: '图片', userFile: '聊天附件', settings: '设置',
+};
+
+/** 单个附件超过这个大小就不还原了：要转成 base64 塞进 JSON，大文件会把内存顶爆 */
+const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024;
+
+/** 把备份里的一个路径归类到"用哪个接口写回去"；返回 null 表示这类不管 */
+function classifyRestoreEntry(name) {
+    if (name.endsWith('/')) return null; // 目录项本身
+
+    const parts = name.split('/');
+    const base = parts[parts.length - 1];
+    const dot = base.lastIndexOf('.');
+    const ext = dot < 0 ? '' : base.slice(dot + 1).toLowerCase();
+    const stem = dot < 0 ? base : base.slice(0, dot);
+    const top = parts[0];
+
+    if (name === 'settings.json') return { kind: 'settings' };
+
+    if (top === 'characters' && parts.length >= 2) {
+        return ['png', 'json', 'yaml', 'yml', 'charx', 'byaf'].includes(ext)
+            ? { kind: 'character', base } : null;
+    }
+    // chats/<角色卡文件名>/<聊天文件名>.jsonl
+    if (top === 'chats' && parts.length >= 3 && ext === 'jsonl') {
+        return { kind: 'chat', base, stem, card: parts[1] };
+    }
+    if (top === 'group chats' && parts.length === 2 && ext === 'jsonl') {
+        return { kind: 'groupChat', base, stem };
+    }
+    if (top === 'groups' && parts.length === 2 && ext === 'json') {
+        return { kind: 'group', base, stem };
+    }
+    if (top === 'worlds' && parts.length === 2 && ext === 'json') return { kind: 'world', base, stem };
+    if (top === 'themes' && parts.length === 2 && ext === 'json') return { kind: 'theme', base, stem };
+    if (top === 'QuickReplies' && parts.length === 2 && ext === 'json') return { kind: 'quickReply', base, stem };
+    if (top === 'movingUI' && parts.length === 2 && ext === 'json') return { kind: 'movingUI', base, stem };
+    if (top === 'backgrounds' && parts.length >= 2 && base) return { kind: 'background', base };
+    if (top === 'User Avatars' && parts.length === 2 && base) return { kind: 'userAvatar', base };
+    if (top === 'user' && parts[1] === 'images' && parts.length >= 3 && base) {
+        return { kind: 'userImage', base, stem, dir: parts.length > 3 ? parts.slice(2, -1).join('/') : '' };
+    }
+    if (top === 'user' && parts[1] === 'files' && parts.length === 3 && base) {
+        return { kind: 'userFile', base };
+    }
+    if (PRESET_DIRECTORIES[top] && parts.length === 2 && ext === 'json') {
+        return { kind: 'preset', base, stem, apiId: PRESET_DIRECTORIES[top] };
+    }
+    return null;
+}
+
+/* ---------------- 每一类的写法 ---------------- */
+
+async function writeCharacter(entry, reader, info) {
+    const blob = await reader.readBlob(entry);
+    const ext = info.base.slice(info.base.lastIndexOf('.') + 1).toLowerCase();
+    const form = new FormData();
+    form.append('avatar', blob, info.base);
+    form.append('file_type', ext);
+    // preserved_name 决定卡片最终叫什么名字。聊天记录是按"卡片文件名"分目录存的，
+    // 这里不保住名字，恢复完的聊天就会全部挂到别的卡上（characters.js:1552）。
+    form.append('preserved_name', info.base);
+    await stMustOk(await stFetch(ST_API.characterImport, { multipart: form }), `导入角色卡 ${info.base}`);
+}
+
+async function writeChat(entry, reader, info) {
+    const text = await reader.readText(entry);
+    const { messages, broken } = stParseJsonl(text);
+    if (broken) console.warn(LOG, `${entry.name} 里有 ${broken} 行解析失败，已跳过`);
+    if (!messages.length) throw new Error('聊天文件里没有任何消息');
+
+    await stMustOk(await stFetch(ST_API.chatSave, {
+        json: {
+            // 服务端只做 avatar_url.replace('.png','') 来推卡片名，所以必须带上 .png
+            avatar_url: `${info.card}.png`,
+            file_name: info.stem,
+            chat: messages,
+            // 旧聊天文件带 integrity 元数据，不传 force 会被拦成 400 {error:'integrity'}
+            force: true,
+        },
+    }), `写入聊天 ${entry.name}`);
+}
+
+async function writeGroupChat(entry, reader, info) {
+    const { messages, broken } = stParseJsonl(await reader.readText(entry));
+    if (broken) console.warn(LOG, `${entry.name} 里有 ${broken} 行解析失败，已跳过`);
+    if (!messages.length) throw new Error('群聊文件里没有任何消息');
+
+    await stMustOk(await stFetch(ST_API.groupChatSave, {
+        json: { id: info.stem, chat: messages, force: true },
+    }), `写入群聊 ${entry.name}`);
+}
+
+async function writeGroup(entry, reader, info) {
+    const group = stParseJson(await reader.readText(entry), entry.name);
+    // edit 是把整个 body 原样写成 groups/<id>.json，所以 id 必须补上（groups.js:190）
+    if (!group.id) group.id = info.stem;
+    await stMustOk(await stFetch(ST_API.groupEdit, { json: group }), `写入群组 ${info.stem}`);
+}
+
+async function writeWorld(entry, reader, info) {
+    const form = new FormData();
+    // 服务端拿上传的文件名当世界书的名字，所以文件名要原样带上
+    form.append('avatar', await reader.readBlob(entry), info.base);
+    await stMustOk(await stFetch(ST_API.worldImport, { multipart: form }), `导入世界书 ${info.base}`);
+}
+
+async function writeTheme(entry, reader, info) {
+    const theme = stParseJson(await reader.readText(entry), entry.name);
+    if (!theme.name) theme.name = info.stem;
+    await stMustOk(await stFetch(ST_API.themeSave, { json: theme }), `写入主题 ${theme.name}`);
+}
+
+async function writePreset(entry, reader, info) {
+    const preset = stParseJson(await reader.readText(entry), entry.name);
+    await stMustOk(await stFetch(ST_API.presetSave, {
+        json: { preset, name: info.stem, apiId: info.apiId },
+    }), `写入预设 ${info.stem}`);
+}
+
+async function writeQuickReply(entry, reader, info) {
+    const set = stParseJson(await reader.readText(entry), entry.name);
+    if (!set.name) set.name = info.stem;
+    await stMustOk(await stFetch(ST_API.quickReplySave, { json: set }), `写入快捷回复 ${set.name}`);
+}
+
+async function writeMovingUI(entry, reader, info) {
+    // 这个文件本身就是接口的请求体（服务端原样写盘），所以原样发回去就行
+    const body = stParseJson(await reader.readText(entry), entry.name);
+    if (!body.name) body.name = info.stem;
+    await stMustOk(await stFetch(ST_API.movingUiSave, { json: body }), `写入界面布局 ${body.name}`);
+}
+
+async function writeBackground(entry, reader, info) {
+    const form = new FormData();
+    // 服务端用上传的文件名当落盘名；背景目录里的子目录会被 sanitize 拍平，这里只传文件名
+    form.append('avatar', await reader.readBlob(entry), info.base);
+    await stMustOk(await stFetch(ST_API.backgroundUpload, { multipart: form }), `上传背景图 ${info.base}`);
+}
+
+async function writeUserAvatar(entry, reader, info) {
+    const form = new FormData();
+    form.append('avatar', await reader.readBlob(entry), info.base);
+    // 不给 overwrite_name 的话，服务端会拿时间戳当文件名，恢复完头像就全变了
+    form.append('overwrite_name', info.base);
+    await stMustOk(await stFetch(ST_API.avatarUpload, { multipart: form }), `上传用户头像 ${info.base}`);
+}
+
+async function writeUserImage(entry, reader, info) {
+    const bytes = new Uint8Array(await reader.readBytes(entry));
+    const body = {
+        image: base64FromBytes(bytes),
+        format: info.base.slice(info.base.lastIndexOf('.') + 1).toLowerCase(),
+    };
+    if (info.dir) body.ch_name = info.dir;
+    body.filename = info.stem;
+    await stMustOk(await stFetch(ST_API.imageUpload, { json: body }), `上传图片 ${entry.name}`);
+}
+
+async function writeUserFile(entry, reader, info) {
+    const bytes = new Uint8Array(await reader.readBytes(entry));
+    if (bytes.length > MAX_ATTACHMENT_BYTES) {
+        return { skipped: `附件 ${info.base} 有 ${(bytes.length / 1048576).toFixed(1)} MB，超过上限已跳过` };
+    }
+    await stMustOk(await stFetch(ST_API.fileUpload, {
+        json: { name: info.base, data: base64FromBytes(bytes) },
+    }), `上传附件 ${info.base}`);
+    return null;
+}
+
+async function writeSettings(entry, reader) {
+    // 这个接口把 body 原样写成 settings.json（settings.js:206），所以必须原封不动发回去
+    const body = stParseJson(await reader.readText(entry), 'settings.json');
+    await stMustOk(await stFetch(ST_API.settingsSave, { json: body }), '写入 settings.json');
+}
+
+const RESTORE_WRITERS = {
+    character: writeCharacter,
+    world: writeWorld,
+    group: writeGroup,
+    chat: writeChat,
+    groupChat: writeGroupChat,
+    theme: writeTheme,
+    preset: writePreset,
+    quickReply: writeQuickReply,
+    movingUI: writeMovingUI,
+    background: writeBackground,
+    userAvatar: writeUserAvatar,
+    userImage: writeUserImage,
+    userFile: writeUserFile,
+    settings: writeSettings,
+};
+
+/**
+ * 把一份备份 zip 还原到本机。
+ *
+ * 每一步都往 localStorage 记进度：一次恢复是几百个请求，iOS 上随时可能被系统杀掉，
+ * 没有进度就得从头再来一遍。marker 是这份备份的标识，换了备份就重新开始。
+ */
+async function restoreFromZip(blob, { marker, fileName }) {
+    notify('info', '正在读取备份…');
+
+    const reader = new ZipReader(blob);
+    await reader.parse();
+
+    const tasks = [];
+    for (const entry of reader.entries) {
+        if (RESTORE_SKIP_PREFIXES.some((prefix) => entry.name.startsWith(prefix))) continue;
+        const info = classifyRestoreEntry(entry.name);
+        if (info) tasks.push({ ...info, entry, name: entry.name });
+        else console.debug(LOG, '备份里这个文件不认识，跳过：', entry.name);
+    }
+    if (!tasks.length) throw new Error('这份备份里没有能还原的数据（可能不是酒馆的用户备份？）');
+
+    const orderOf = new Map(RESTORE_ORDER.map((kind, index) => [kind, index]));
+    tasks.sort((a, b) => (orderOf.get(a.kind) - orderOf.get(b.kind)) || a.name.localeCompare(b.name));
+
+    const s = settings();
+    const progress = (s.restoreProgress && s.restoreProgress.marker === marker)
+        ? s.restoreProgress
+        : { marker, done: [] };
+    s.restoreProgress = progress;
+    const done = new Set(progress.done);
+    const alreadyDone = tasks.filter((task) => done.has(task.name)).length;
+
+    const skipped = [];
+    let written = 0;
+
+    try {
+        for (let i = 0; i < tasks.length; i += 1) {
+            const task = tasks[i];
+            if (done.has(task.name)) continue;
+
+            STATE.restore = { label: RESTORE_LABELS[task.kind] || task.kind, done: i + 1, total: tasks.length };
+            renderStatus();
+
+            try {
+                const result = await RESTORE_WRITERS[task.kind](task.entry, reader, task);
+                if (result && result.skipped) skipped.push(result.skipped);
+                // 只有写成功的才记进度；失败的留着，下次同步会再试一遍
+                done.add(task.name);
+                progress.done = [...done];
+            } catch (err) {
+                // 单个文件失败不该让整次恢复前功尽弃：记下来接着写下一个，最后一次性报告
+                console.warn(LOG, `还原失败 ${task.name}`, err);
+                skipped.push(`${task.name}：${err.message}`);
+            }
+
+            persist();
+            written += 1;
+        }
+    } finally {
+        STATE.restore = null;
+    }
+
+    // 记账用完就清掉，免得下次换一份备份时拿它当进度
+    s.restoreProgress = null;
+    persist();
+
+    return { written, skipped, alreadyDone, total: tasks.length, fileName };
 }
 
 /* ---------------------------------------------------------------- 同步逻辑 */
@@ -471,19 +1234,29 @@ async function pullOne(device, latest) {
     if (latest.size && blob.size !== latest.size) {
         throw new Error(`下载的备份大小对不上（期望 ${latest.size}，实际 ${blob.size}），可能传输中断，已放弃恢复`);
     }
-    await restoreFromBlob(blob, latest.fileName);
-    rememberPulled(device, markerOf(latest));
-    return blob.size;
+
+    const report = await restoreFromZip(blob, {
+        marker: markerOf(latest) || latest.fileName,
+        fileName: latest.fileName,
+    });
+
+    // 有文件没写成，就先别记账。记了账等于"这份已经拿过了"，失败的那些再没机会重试；
+    // 不记账的话下次同步会重拉一遍，把没写完的补上（写过的会按进度跳过）。
+    if (!report.skipped.length) rememberPulled(device, markerOf(latest));
+
+    return report;
 }
 
 async function pullUpdates(updates) {
-    // 恢复会整份替换磁盘数据，过程中酒馆会甩出一堆事件，那些不是用户改动，先挂起检测
+    // 恢复期间酒馆会甩出一堆事件，那些不是用户改动，先挂起检测
     STATE.suppressDirty = true;
-    let restored = 0;
+    let files = 0;
+    const skipped = [];
     try {
         for (const item of updates) {
-            await pullOne(item.device, item.latest);
-            restored += 1;
+            const report = await pullOne(item.device, item.latest);
+            files += report.written;
+            skipped.push(...report.skipped);
         }
         clearDirty();
     } finally {
@@ -491,16 +1264,28 @@ async function pullUpdates(updates) {
         setTimeout(() => { STATE.suppressDirty = false; }, 5000);
     }
 
-    notify('success', `已恢复 ${restored} 个备份`);
+    if (skipped.length) {
+        notify('warn',
+            `已还原 ${files} 个文件，${skipped.length} 项没写成（下次同步会重试）：\n` +
+            skipped.slice(0, 5).join('\n') +
+            (skipped.length > 5 ? `\n…还有 ${skipped.length - 5} 项，详见控制台` : ''));
+    } else {
+        notify('success', `已还原 ${files} 个文件`);
+    }
     await offerReload();
 }
 
-/** 恢复是覆盖式的，酒馆内存里还是旧数据，必须刷新页面才看得到 */
+/**
+ * 恢复完之后必须尽快刷新页面，而不只是"建议刷新"：
+ * 酒馆内存里的设置还是旧的，而它是会往 settings.json 回写的 ——
+ * 拖得越久，刚还原好的设置越可能被内存里那份旧设置覆盖回去。
+ */
 async function offerReload() {
     const reload = await askUser(
-        '数据已恢复。酒馆页面里还是旧内容，必须刷新才能加载新数据。',
+        '数据已还原。酒馆内存里还是旧内容，必须刷新才能加载。\n' +
+        '⚠️ 别在这时候继续操作 —— 酒馆会把旧的设置写回磁盘，把刚还原好的覆盖掉。',
         '立即刷新',
-        '稍后自己刷',
+        '稍后自己刷（有风险）',
     );
     if (reload) location.reload();
 }
@@ -596,8 +1381,10 @@ async function resolveConflict(updates) {
 
     const who = updates.map((u) => u.device).join('、');
     const useRemote = await askUser(
-        `本地有还没上传的改动，云端「${who}」也有新的备份。\n两边都动过了，必须选一边，另一边的改动会丢掉。`,
-        `用「${who}」的覆盖本机`,
+        `本地有还没上传的改动，云端「${who}」也有新的备份。\n` +
+        '两边都动过了，只能选一边：选中的这方会覆盖另一方改过的那些文件。\n' +
+        '本机独有的内容不会被删掉（还原是按类写回，不是清空重来）。',
+        `用「${who}」的写回本机`,
         '用本机的覆盖云端',
     );
     if (useRemote) {
@@ -678,7 +1465,9 @@ const PANEL_HTML = `
         两台酒馆各装一份本扩展，<b>本机标识必须不同</b>（一台 local，一台 cloud）。<br />
         <b>打开页面时</b>：自动判断云端最新备份是本机还是对面的，云端更新就拉，本机有改动就推。<br />
         <b>使用期间</b>：按上面设定的间隔自动上传（只传不拉，不会打断你聊天）。<br />
-        恢复是<b>整份覆盖</b>，不是合并。两边都改过时会先问你，不会闷头覆盖。
+        恢复是<b>合并式还原</b>：按类把对面的数据写回本机，同名覆盖，
+        <b>但不会删掉本机多出来的角色卡或聊天</b>。两边都改过时会先问你，不会闷头覆盖。<br />
+        角色画廊图、向量库、扩展私有文件这三类酒馆没有写入接口，还原不了（见 README）。
       </div>
     </div>
   </div>
@@ -755,7 +1544,9 @@ function buildUI() {
     bindField('#st_sync_keep', 'keepSnapshots', { number: true });
 
     $('#st_sync_btn_test').on('click', testConnection);
+
     $('#st_sync_btn_push').on('click', async () => {
+        if (STATE.busy) { notify('info', '正在忙，等当前操作结束'); return; }
         const go = await askUser('把本机数据打包上传到中转？只会新增一个快照，不动本机数据。', '上传', '取消');
         if (!go) return;
         STATE.busy = true; renderStatus();
@@ -768,41 +1559,59 @@ function buildUI() {
             STATE.busy = false; renderStatus();
         }
     });
+
     $('#st_sync_btn_pull').on('click', async () => {
+        if (STATE.busy) { notify('info', '正在忙，等当前操作结束'); return; }
         try {
             requireConfig();
         } catch (err) {
             notify('error', err.message);
             return;
         }
+
         const s = settings();
         const other = s.deviceId === 'local' ? 'cloud' : 'local';
+
+        // 这个是"我就是要拉对面那份"，所以不看"有没有新备份"——直接读对面的 latest.json。
+        // 上次还原到一半被打断的话，进度会让人接着写，不用从头再来。
+        let latest = null;
+        try {
+            latest = await readRemoteLatest(other);
+        } catch (err) {
+            notify('error', err.message);
+            return;
+        }
+        if (!latest || !latest.fileName) {
+            notify('warn', `中转上没有「${other}」的备份，先在对面点一次「上传到中转」`);
+            return;
+        }
+
         const go = await askUser(
-            `从中转拉取「${other}」的最新备份并覆盖本机？\n本机现有数据会被整份替换掉。`,
-            '覆盖本机',
+            `从中转拉取「${other}」的备份（${latest.fileName}），按类写回本机？\n` +
+            '同名文件会被覆盖；本机多出来的角色卡和聊天不会被删除。\n' +
+            '结束后需要刷新页面。',
+            '开始还原',
             '取消',
         );
         if (!go) return;
+
         STATE.busy = true; renderStatus();
         try {
-            const updates = await collectRemoteUpdates();
-            if (!updates.length) {
-                notify('info', '没有可拉取的新备份');
-            } else {
-                await pullUpdates(updates);
-            }
+            await pullUpdates([{ device: other, latest }]);
         } catch (err) {
             notify('error', err.message);
         } finally {
             STATE.busy = false; renderStatus();
         }
     });
+
     $('#st_sync_btn_sync').on('click', () => syncNow());
 
     renderStatus();
 }
 
 async function testConnection() {
+    if (STATE.busy) { notify('info', '正在忙，等当前操作结束'); return; }
     STATE.busy = true;
     renderStatus();
     try {

@@ -1,24 +1,29 @@
 # SillyTavern 备份接口探测脚本
 
-## 已经测出来的结果（2026-10，SillyTavern 1.18.0，官方镜像）
+## 已经核实的结果（2026-10，SillyTavern 1.18.0）
 
-在 `https://sillytarven.zeabur.app` 上实测确认：
+> ⚠️ **2026-10-01 更正。** 这张表早先是照着一次控制台探测填的，其中关于"恢复"的两行**是错的**，
+> 而且错在推理上——当时把"400"当成了"路由存在"的证据。之后逐文件核对了 1.18.0 的源码，
+> 结论如下。源码位置一并列出，换版本后照着复核一遍，比再猜一次快。
 
-| 接口 | 结果 | 结论 |
+| 接口 | 事实 | 依据 |
 |---|---|---|
-| `POST /api/users/backup` | 200，返回 zip | ✅ **下载备份的正确接口** |
-| `POST /api/backups/restore` | 400（空表单） | ✅ **恢复备份的正确接口** |
-| `POST /api/backups/download` | 404 | ❌ 旧路径，1.18.0 已不在这里 |
-| `GET /api/backups/` | 404 | ❌ 不存在 |
+| `POST /api/users/backup` | ✅ 下载备份的正确接口。**但请求体必须带 `{"handle":"…"}`**，不带直接 400 `Missing required fields` | `src/endpoints/users-private.js:146`：`const handle = request.body.handle` |
+| `GET /api/users/me` | 取当前用户 handle，用来喂上面那个参数 | `src/endpoints/users-private.js:35` |
+| `POST /api/backups/restore` | ❌ **1.18.0 里没有这个路由** | `src/endpoints/backups.js` 全文只有 `chat/get`、`chat/delete`、`chat/download` 三条 |
+| `POST /api/backups/download` | ❌ 旧路径，已不在这里 | 同上 |
+| 任何"上传 zip 还原整份备份"的接口 | ❌ **不存在** | `src/users.js` 只有 `createBackupArchive`（写 zip），没有对应的解包函数；`public/scripts/user.js` 里前端只有 `backupUserData`（下载）和 `restoreSnapshot`（还原**服务端快照**，只含 settings），没有任何地方上传备份文件 |
 
-两个关键教训，换版本重新探测时注意：
+三条教训：
 
-1. **下载和恢复不在同一个文件里**。下载挪到了 `/api/users/`，恢复还在 `/api/backups/`。
-   看到 `/api/backups/` 前缀就以为下载也在那儿，会直接踩坑。
-2. **400 不等于路由不存在**。恢复接口返回 400 是因为我们故意发了空表单（缺文件），
-   这恰恰说明路由是存在的。区分"404 路由不存在"和"400 参数不对"很重要。
+1. **状态码不能代替读源码。** 空表单返回 400 被当成了"路由存在"，这是错的——兜底中间件同样会回 400。
+   要确认路由在不在，去 `src/endpoints/` 里 `grep router.` 数一遍。
+2. **`/api/backups` 下那个 `backups.js` 跟用户数据备份是两码事**，它只管聊天记录备份。
+   用户数据的备份接口在 `src/endpoints/users-private.js` 里，别被路径前缀骗了。
+3. **每个"已实测确认"都写清文件和行号**，否则下一个人（包括我自己）还得重猜一遍。
 
-扩展里已经按这个结果改好了（`extension/st-sync/index.js` 顶部的 `ST_API`）。
+**当前结论：恢复这一半是缺的。** 浏览器侧没有任何受支持的方式把一份 zip 还原进酒馆数据目录，
+需要另定方案（服务端插件，或改成按类型重新导入）。见仓库根目录 README 的「已知限制」。
 
 ---
 
@@ -82,6 +87,26 @@ SillyTavern 的备份/恢复接口在不同版本之间**路由和方法都变�
 
   // ---- 2. 下载备份（会生成一个备份，安全）----
   say('--- 2. 生成并下载备份 ---');
+
+  // ★ 1.18.0 的正确姿势：先拿 handle，再带上 JSON body 请求。
+  // 少了 body 里的 handle 就是 400，这一条踩过一次坑，别删。
+  try {
+    const me = await fetch('/api/users/me', { headers });
+    const user = me.ok ? await me.json() : {};
+    const handle = user.handle || 'default-user';
+    const r = await fetch('/api/users/backup', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ handle }),
+    });
+    say(`POST /api/users/backup (handle=${handle}) -> ${r.status}  ` +
+        `type=${r.headers.get('content-type') || ''}  disp=${r.headers.get('content-disposition') || ''}`);
+    try { await r.body?.cancel(); } catch {}
+  } catch (e) {
+    say('POST /api/users/backup 失败: ' + e.message);
+  }
+
+  // 下面这些是历史候选，留着是为了换版本时还能自动扫一遍
   const downloadCandidates = [
     ['POST', '/api/backups/download'],
     ['GET',  '/api/backups/download'],
@@ -109,8 +134,11 @@ SillyTavern 的备份/恢复接口在不同版本之间**路由和方法都变�
   say('');
 
   // ---- 3. 恢复接口探测（故意不带文件，看路由是否存在）----
+  // ⚠️ 已知 1.18.0 这三条全都不存在，下面必然是 404。留着的意义只有一个：
+  //    如果哪天某条开始回非 404，说明上游终于加了"上传备份还原"的接口，那就有救了。
+  //    注意别再把 400 当成"路由存在"——那是上一版文档犯过的错。
   say('--- 3. 恢复接口（故意不传文件，只看路由存不存在）---');
-  say('    404 = 路由不存在；400/500 = 路由存在但缺文件。此操作不会恢复任何数据。');
+  say('    404 = 路由不存在。1.18.0 预期全部 404。此操作不会恢复任何数据。');
   const restoreCandidates = [
     ['POST', '/api/backups/restore'],
     ['POST', '/api/backups/upload'],

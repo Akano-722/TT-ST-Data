@@ -15,12 +15,17 @@ const LOG = '[ST-Sync]';
 /* ------------------------------------------------------------------ *
  * 已实测确认（SillyTavern 1.18.0，官方镜像 ghcr.io/sillytavern/sillytavern）：
  *   下载备份  POST /api/users/backup      —— 注意不是 /api/backups/download，那是旧路径
- *   恢复备份  POST /api/backups/restore   —— 和下载不在同一个文件里，别被路径前缀误导
+ *             请求体必须带 { handle }，不带就是 400（见 currentHandle 的注释）
+ *   当前用户  GET  /api/users/me          —— 用来取上面那个 handle
  * 换版本后若失效，用 tools/probe-st-backup.md 重新探测。
+ *
+ * ⚠️ 恢复备份（ST_API.restore）在 1.18.0 的源码里查无此路由：酒馆前端只能下载备份，
+ *    从来没有"上传备份还原"的接口。这条路径是坏的，见 README「已知限制」。
  * ------------------------------------------------------------------ */
 const ST_API = {
     download: { method: 'POST', url: '/api/users/backup' },
     restore: { method: 'POST', url: '/api/backups/restore' },
+    me: { method: 'GET', url: '/api/users/me' },
 };
 
 /**
@@ -255,14 +260,51 @@ async function relayDelete(key) {
 
 /* -------------------------------------------------------------- 酒馆备份接口 */
 
+/**
+ * 当前用户的 handle。
+ *
+ * 下载备份的接口只认请求体里的 handle：`POST /api/users/backup` 读的是 `request.body.handle`，
+ * 不带就立刻 400 Missing required fields —— 不是路由不对，是缺参数。
+ * 酒馆自己的前端也是这么传的（public/scripts/user.js：backupUserData → getCurrentUserHandle）。
+ *
+ * 拿不到时退回 'default-user'，和酒馆前端的兜底保持一致：没开账号系统时服务端看到的
+ * 也正是这个 handle，两边对得上。
+ */
+let cachedHandle = '';
+
+async function currentHandle() {
+    if (cachedHandle) return cachedHandle;
+
+    let handle = '';
+    try {
+        const res = await fetch(ST_API.me.url, { headers: ctx().getRequestHeaders() });
+        if (res.ok) {
+            const user = await res.json();
+            handle = user && user.handle ? String(user.handle) : '';
+        } else {
+            console.warn(LOG, `GET ${ST_API.me.url} 返回 HTTP ${res.status}，退回 default-user`);
+        }
+    } catch (err) {
+        console.warn(LOG, '取当前用户失败，退回 default-user', err);
+    }
+
+    cachedHandle = handle || 'default-user';
+    return cachedHandle;
+}
+
 async function buildLocalBackup() {
+    const handle = await currentHandle();
     const res = await fetch(ST_API.download.url, {
         method: ST_API.download.method,
         headers: ctx().getRequestHeaders(),
+        body: JSON.stringify({ handle }),
     });
     if (!res.ok) {
+        // 服务端出错时回的是 JSON（比如 {"error":"Missing required fields"}），
+        // 把它带进错误里，省得下次又只能对着一个状态码猜。
+        const detail = await res.text().catch(() => '');
         throw new Error(
-            `酒馆生成备份失败 HTTP ${res.status}。` +
+            `酒馆生成备份失败 HTTP ${res.status}${detail ? `：${detail.slice(0, 200)}` : ''}。` +
             `接口可能对不上，先跑 tools/probe-st-backup.md 确认路由`,
         );
     }

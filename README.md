@@ -5,10 +5,36 @@
 它只调用酒馆已有的 HTTP 接口（生成备份 / 恢复备份），**不改动任何酒馆后端代码**，
 也不依赖构建工具——三个文件丢进去就能用。
 
-整体的两端同步方案见仓库根目录的 [README](../../README.md)，
-中转服务本身见 [relay/README.md](../../relay/README.md)。
+整体的两端同步方案见仓库的
+[README](https://github.com/Akano-722/TT-ST-Data/blob/main/README.md)，
+中转服务本身见
+[relay/README.md](https://github.com/Akano-722/TT-ST-Data/blob/main/relay/README.md)。
 
 ## 安装
+
+### 方式一：从 GitHub 装（推荐）
+
+酒馆的「扩展」面板 → **安装扩展** → 填两项：
+
+| 字段 | 填什么 |
+|---|---|
+| URL | `https://github.com/Akano-722/TT-ST-Data` |
+| Branch or tag name | `extension` |
+
+⚠️ **分支那一栏必须填 `extension`，不能留空。**
+
+这个仓库是 monorepo（中转服务也在里面），默认分支 `main` 的**根目录没有 `manifest.json`**
+——扩展文件在 `extension/st-sync/` 子目录下。而酒馆的安装逻辑是：把整个仓库 clone 下来，
+**在根目录找 `manifest.json`**（`src/endpoints/extensions.js` 的 `getManifest`）。找不到就
+**把刚 clone 的目录删掉**并返回 500，界面上只显示"安装失败"，不留任何痕迹。
+
+`extension` 分支是 `git subtree split` 从 `extension/st-sync/` 切出来的，
+**它的根目录就是扩展本身**，所以酒馆能在根目录找到 manifest。
+
+> 装完文件夹名会是仓库名（`third-party/TT-ST-Data/`），这是正常的——
+> 酒馆扫描的是 third-party 下的所有子目录，文件夹叫什么不影响加载。
+
+### 方式二：手动拷贝
 
 把整个 `st-sync/` 文件夹放进两台酒馆的：
 
@@ -16,10 +42,12 @@
 <SillyTavern>/public/scripts/extensions/third-party/st-sync/
 ```
 
+### 装完确认
+
 刷新酒馆页面，在「扩展」面板（`#extensions_settings`）里就能看到**酒馆云同步**。
 
-> 装完刷新后如果没出现，看浏览器控制台有没有 `[ST-Sync]` 开头的日志——
-> 有的话是加载成功但面板位置不对，没有的话是文件路径放错了。
+> 没出现的话，看浏览器控制台有没有 `[ST-Sync]` 开头的日志——
+> 有就是加载成功了但面板位置不对，没有就是没加载上（方式一多半是分支填错了）。
 
 ## 配置
 
@@ -101,8 +129,9 @@ const ST_API = {
 
 **这两个接口在两个不同前缀下**（下载在 `/api/users/`，恢复在 `/api/backups/`），
 别被路径前缀误导。已在 SillyTavern 1.18.0 官方镜像上实测确认。
-换酒馆版本后如果失效，用 [`tools/probe-st-backup.md`](../../tools/probe-st-backup.md) 重新探测，
-改这里即可。
+换酒馆版本后如果失效，用
+[`tools/probe-st-backup.md`](https://github.com/Akano-722/TT-ST-Data/blob/main/tools/probe-st-backup.md)
+重新探测，改这里即可。
 
 恢复接口的 multipart 字段名在各版本间变过，扩展会按 `backup` → `file` → `upload` → `avatar`
 的顺序试，第一个成功的记进设置的 `restoreField`，之后直接用。所以**第一次恢复可能慢一点**，正常。

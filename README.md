@@ -60,12 +60,35 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 | GET | `/v1/ns/:ns/:bucket/*key` | 下载 |
 | GET | `/v1/ns/:ns/:bucket` | 列出文件与总用量 |
 | DELETE | `/v1/ns/:ns/:bucket/*key` | 删除 |
+| GET | `/admin` | **管理后台页面**，见下节 |
 | GET | `/admin/namespaces` | 列出命名空间（管理员令牌） |
 | POST | `/admin/namespace` | 创建命名空间，返回令牌（管理员令牌） |
+| GET | `/admin/namespaces/:ns/buckets` | 列出某命名空间下的桶，含创建时间（管理员令牌） |
+| GET | `/admin/namespaces/:ns/buckets/:bucket` | 列出桶内文件（管理员令牌） |
+| GET | `/admin/namespaces/:ns/buckets/:bucket/files/*key` | 下载文件（管理员令牌） |
 | POST | `/admin/invite` | 签发邀请码（管理员令牌 + `ENABLE_INVITES=true`） |
 | POST | `/v1/invite/redeem` | 用邀请码换令牌 |
 
 根路径 `/` 会返回这份清单和当前版本号，方便部署完确认服务活着。
+
+## 管理后台
+
+浏览器打开 `http://<你的中转地址>/admin`，填 `ADMIN_TOKEN`，然后：
+
+**选命名空间 → 看桶 → 看文件 → 点 JSON 直接读内容，其余点「下载」。**
+
+页面本身**不需要令牌**（它就是一张静态 HTML，数据全靠接口现拿），令牌只在你点「连接」之后
+由页面带着去请求接口，存在这台浏览器的 `localStorage` 里。点「忘记令牌」可以清掉。
+
+几个说明：
+
+- **这是只读页面。** 不能删文件、不能建桶——删除不可逆，不做。
+- **桶的「新增时间」是推算的。** 磁盘上没有"创建桶"这个动作，第一次写入时目录才出现，
+  没有任何地方记着创建时间。页面显示的是**桶内最早那个文件的 mtime**。桶被清空后这个值会变成 `—`。
+- **它能看到所有人的数据。** `/admin/namespaces/:ns/...` 这几条接口按设计绕过了命名空间隔离——
+  这是管理员该有的权限，但也意味着 `ADMIN_TOKEN` 等于全部数据的钥匙，别随便给人。
+- 页面的核心用途之一是排查同步问题：直接打开 `tavern/devices/<设备>/latest.json`，
+  看看某台设备最近一次上传到底写进去没有。
 
 ## 运维注意
 

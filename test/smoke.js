@@ -313,6 +313,77 @@ async function main() {
         assertEqual(res.status, 200, '状态码');
     });
 
+    console.log('\n管理浏览接口（后台用的）:');
+    await check('管理员列出命名空间，包含 A 与 B', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces`, { headers: authHeaders(ADMIN_TOKEN) });
+        const body = await res.json();
+        assertEqual(res.status, 200, '状态码');
+        const names = body.namespaces.map((item) => item.namespace);
+        assert(names.includes('A') && names.includes('B'), `实际: ${JSON.stringify(names)}`);
+    });
+
+    await check('管理员列出 A 的桶，含文件数与新增时间', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces/A/buckets`, {
+            headers: authHeaders(ADMIN_TOKEN),
+        });
+        const body = await res.json();
+        assertEqual(res.status, 200, '状态码');
+        const tavern = body.buckets.find((item) => item.bucket === 'tavern');
+        assert(tavern, `没找到 tavern 桶：${JSON.stringify(body.buckets)}`);
+        assertEqual(tavern.count, 1, '文件数');   // 只剩重启前写的 persist.txt
+        assertEqual(tavern.usage, 10, '字节数');  // 'survive me'
+        assert(Number.isFinite(tavern.createdAt), `新增时间应是时间戳，实际 ${tavern.createdAt}`);
+        assert(Number.isFinite(tavern.lastModified), `最近修改应是时间戳，实际 ${tavern.lastModified}`);
+    });
+
+    await check('管理员列出桶内文件', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces/A/buckets/tavern`, {
+            headers: authHeaders(ADMIN_TOKEN),
+        });
+        const body = await res.json();
+        assertEqual(res.status, 200, '状态码');
+        assertEqual(body.count, 1, '文件数');
+        assertEqual(body.files[0].key, 'persist.txt', 'key');
+    });
+
+    await check('管理员下载文件内容一致', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces/A/buckets/tavern/files/persist.txt`, {
+            headers: authHeaders(ADMIN_TOKEN),
+        });
+        assertEqual(res.status, 200, '状态码');
+        assertEqual(await res.text(), 'survive me', '内容');
+    });
+
+    await check('管理员下载不存在的文件返回 404', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces/A/buckets/tavern/files/nope.txt`, {
+            headers: authHeaders(ADMIN_TOKEN),
+        });
+        assertEqual(res.status, 404, '状态码');
+    });
+
+    await check('普通命名空间令牌访问管理浏览接口被拒', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces/A/buckets`, {
+            headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        assertEqual(res.status, 403, '状态码');
+    });
+
+    await check('管理浏览接口的路径穿越被拒绝', async () => {
+        const res = await rawRequest(
+            'GET',
+            '/admin/namespaces/A/buckets/tavern/files/../../../../auth.json',
+            { token: ADMIN_TOKEN },
+        );
+        assertEqual(res.status, 400, '状态码');
+        assert(!/tokenHash/.test(res.body), 'auth.json 内容疑似泄露');
+    });
+
+    await check('管理后台页面可访问，且不需要令牌', async () => {
+        const res = await fetch(`${BASE}/admin`);
+        assertEqual(res.status, 200, '状态码');
+        assert(/ST Sync/.test(await res.text()), '拿到的不是后台页面');
+    });
+
     await stopServer(server);
 
     console.log('\n邀请码（启用态）:');

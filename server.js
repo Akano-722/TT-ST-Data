@@ -117,8 +117,12 @@ app.get('/', (req, res) => {
             get: 'GET    /v1/ns/:ns/:bucket/*key',
             list: 'GET    /v1/ns/:ns/:bucket              (列出文件与用量)',
             remove: 'DELETE /v1/ns/:ns/:bucket/*key',
+            adminUI: 'GET    /admin                       (管理后台页面，页面本身不需要令牌)',
             adminNamespaces: 'GET    /admin/namespaces            (需管理员令牌)',
             adminNamespace: 'POST   /admin/namespace             (需管理员令牌)',
+            adminBuckets: 'GET    /admin/namespaces/:ns/buckets             (需管理员令牌)',
+            adminBucket: 'GET    /admin/namespaces/:ns/buckets/:bucket      (需管理员令牌)',
+            adminFile: 'GET    /admin/namespaces/:ns/buckets/:bucket/files/*key (需管理员令牌)',
             adminInvite: 'POST   /admin/invite                (需管理员令牌，且 ENABLE_INVITES=true)',
             redeem: 'POST   /v1/invite/redeem',
         },
@@ -245,6 +249,64 @@ app.post('/admin/invite', requireAdmin, jsonBody, async (req, res, next) => {
     }
 });
 
+// ---- 管理：浏览各命名空间的数据（只读）----
+// /admin 那个页面用的。注意这三条**刻意绕过了命名空间隔离**：一个 ADMIN_TOKEN
+// 能看所有人的数据。这是管理员该有的权限，也正因如此它们只能挂在 requireAdmin 下，
+// 绝不能挪到 authenticate 那一套里去。
+//
+// 路径嵌在 /admin/namespaces 下面，是为了不和 POST /admin/namespace 撞车——
+// 那条是"建命名空间"，少一个 s，两条路互不影响。
+
+app.get('/admin/namespaces/:ns/buckets', requireAdmin, async (req, res, next) => {
+    try {
+        assertSegment(req.params.ns, 'namespace');
+        const buckets = await storage.listBuckets([req.params.ns]);
+        res.json({ ok: true, namespace: req.params.ns, buckets });
+    } catch (err) {
+        next(err);
+    }
+});
+
+app.get('/admin/namespaces/:ns/buckets/:bucket', requireAdmin, async (req, res, next) => {
+    try {
+        assertSegment(req.params.ns, 'namespace');
+        assertSegment(req.params.bucket, 'bucket');
+        const files = await storage.list([req.params.ns, req.params.bucket]);
+        const usage = files.reduce((sum, file) => sum + file.size, 0);
+        res.json({
+            ok: true,
+            namespace: req.params.ns,
+            bucket: req.params.bucket,
+            count: files.length,
+            usage,
+            files,
+        });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// 下载。写法和 /v1/ns/:ns/:bucket/* 那条完全一致，只是鉴权换成了管理员令牌——
+// 后台要能直接看 latest.json，光有列表不够。
+app.get('/admin/namespaces/:ns/buckets/:bucket/files/*', requireAdmin, async (req, res, next) => {
+    try {
+        assertSegment(req.params.ns, 'namespace');
+        assertSegment(req.params.bucket, 'bucket');
+        const target = await storage.stat([req.params.ns, req.params.bucket, ...keyPartsOf(req)]);
+        if (!target) return res.status(404).json({ error: '文件不存在' });
+
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', String(target.size));
+        res.setHeader('X-Mtime', String(target.mtime));
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Length,X-Mtime');
+        await pipeline(fs.createReadStream(target.abs), res);
+        return undefined;
+    } catch (err) {
+        if (res.headersSent) return res.destroy();
+        return next(err);
+    }
+});
+
 // ---- 邀请码兑换（给朋友用，默认关闭）----
 
 app.post('/v1/invite/redeem', jsonBody, async (req, res, next) => {
@@ -266,6 +328,20 @@ app.post('/v1/invite/redeem', jsonBody, async (req, res, next) => {
         next(err);
     }
 });
+
+// ---------------------------------------------------------------- 管理后台页面
+
+// 页面本身**不需要令牌**——它只是一张静态 HTML，数据全靠上面的接口现拿，
+// 而接口是要 ADMIN_TOKEN 的。所以这里托管静态文件不构成泄露面。
+// 必须注册在所有 /admin API 之后：先来的先匹配，/admin/namespaces 仍然走 JSON 接口，
+// 只有没被 API 接住的路径（也就是 GET /admin 本身）才落到这里。
+//
+// 单独给 /admin 一条：光靠 express.static 的话，访问 /admin 会先吃一个 301 跳到 /admin/。
+// 浏览器会跟，但 curl 和脚本里就多一次跳转，不如直接给。
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+app.use('/admin', express.static(path.join(__dirname, 'public')));
 
 // ---------------------------------------------------------------- 兜底
 

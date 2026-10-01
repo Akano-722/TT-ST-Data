@@ -52,6 +52,7 @@ const EXPORTS = [
     'pullOne', 'restoreFromZip', 'restoreViaNativeImport', 'waitForImportJob',
     'isTauriTavern', 'restoreModeHint', 'settings', 'STATE', 'TIMEOUT_MS', 'DM_API',
     'JOB_POLL_INTERVAL_MS', 'JOB_TIMEOUT_MS',
+    'EXT_VERSION', 'log', 'LOG_LINES', 'LOG_MAX_LINES', 'logText', 'beginBusy', 'endBusy',
 ];
 
 /**
@@ -493,6 +494,87 @@ async function testJobOutcomes(bad_) {
     }
 }
 
+/**
+ * 诊断设施本身。
+ *
+ * 这一组是被真实事故逼出来的：手机上点了上传"什么都没发生"，而代码里所有排查线索
+ * 都只往 console 写 —— 手机上没有控制台，等于一条线索都没有。
+ * 所以面板日志、忙碌秒表、状态栏步骤这几样必须greppy得住，坏一个就又回到"点了没反应"。
+ */
+async function testDiagnostics(bad_) {
+    console.log('\n── 诊断设施：面板日志 / 忙碌秒表 / 状态栏步骤 ──');
+
+    const srv = await startServer('hang-headers');
+    try {
+        const { api } = loadExtension({
+            fetchImpl: (url, opts) => fetch(url, opts),
+            seed: configSeed(srv.url),
+        });
+
+        if (typeof api.EXT_VERSION !== 'string' || !api.EXT_VERSION.trim()) {
+            bad('没有版本号', `EXT_VERSION=${JSON.stringify(api.EXT_VERSION)}；更新后没法确认跑的是哪一版`);
+        } else {
+            ok('有版本号，更新后能对着面板确认跑的是哪一版', api.EXT_VERSION);
+        }
+
+        // 面板日志：log() 得真的攒下来，不然手机上没东西可截图
+        const before = api.LOG_LINES.length;
+        api.log('测试行一', '附加');
+        if (api.LOG_LINES.length !== before + 1) bad('log() 没往缓冲里记', String(api.LOG_LINES.length));
+        else if (!api.LOG_LINES[api.LOG_LINES.length - 1].includes('测试行一 附加')) {
+            bad('日志内容不对', api.LOG_LINES[api.LOG_LINES.length - 1]);
+        } else {
+            ok('log() 记进了面板缓冲（手机上可截图/复制）');
+        }
+
+        // 缓冲要有上限，否则跑一天会把内存吃光。
+        // 次数必须写死：log() 自己就会裁剪，拿 length 当循环条件会永远停不下来。
+        for (let i = 0; i < api.LOG_MAX_LINES + 50; i++) api.log('灌');
+        if (api.LOG_LINES.length > api.LOG_MAX_LINES) {
+            bad('日志缓冲没有上限', `${api.LOG_LINES.length} 行 > ${api.LOG_MAX_LINES}`);
+        } else {
+            ok(`日志缓冲有上限（最多 ${api.LOG_MAX_LINES} 行）`);
+        }
+
+        // 忙碌秒表：状态栏要能显示"已 N 秒"，卡死才看得出来
+        api.beginBusy('测试步骤');
+        if (!api.STATE.busy || !api.STATE.busySince) bad('beginBusy 没起作用', JSON.stringify(api.STATE.busySince));
+        else if (!api.STATE.ticker) bad('没有起秒表', '状态栏上的秒数不会走');
+        else ok('beginBusy：忙碌标记 + 秒表都起来了');
+
+        api.endBusy();
+        if (api.STATE.busy || api.STATE.busySince || api.STATE.step) {
+            bad('endBusy 没清干净', JSON.stringify({ busy: api.STATE.busy, step: api.STATE.step }));
+        } else if (api.STATE.ticker) {
+            // 泄漏的 setInterval 在页面里会一直跑，也会让测试进程不退出
+            bad('endBusy 没停秒表', '定时器泄漏，页面里会一直空转');
+        } else {
+            ok('endBusy：忙碌标记、步骤、秒表全清干净（不泄漏定时器）');
+        }
+
+        // 卡住的时候，状态栏得知道卡在哪一步 —— 这是"点了没反应"唯一的线索
+        const pending = api.timedFetch(`${srv.url}/hang`, {}, { timeoutMs: 600, what: '测试步骤标签' })
+            .catch((err) => err);
+        await new Promise((r) => setTimeout(r, 150));
+        if (api.STATE.step !== '测试步骤标签') {
+            bad('请求进行中时状态栏没拿到步骤名', `STATE.step=${JSON.stringify(api.STATE.step)}`);
+        } else {
+            ok('请求进行中时状态栏显示当前步骤', api.STATE.step);
+        }
+        const err = await pending;
+        if (!err || !err.isTimeout) bad('那次请求没按预期超时', String(err && err.message));
+        else ok('超时后仍然是超时错误（不是别的）');
+
+        if (api.LOG_LINES.some((l) => l.includes('测试步骤标签 超时'))) {
+            ok('超时这件事也进了面板日志');
+        } else {
+            bad('超时没进面板日志', '手机上还是什么都看不到');
+        }
+    } finally {
+        await srv.close();
+    }
+}
+
 /** 导入接口本身的失败（HTTP 非 200、或 ok:false）要能报出来 */
 async function testImportSubmitFailure(bad_) {
     console.log('\n── 提交导入任务失败 ──');
@@ -555,6 +637,7 @@ async function main() {
     await testClassicBranch(bad);
     await testJobOutcomes(bad);
     await testImportSubmitFailure(bad);
+    await testDiagnostics(bad);
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`通过 ${pass}　失败 ${fail}`);

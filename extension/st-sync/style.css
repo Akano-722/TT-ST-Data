@@ -64,3 +64,42 @@
     margin-top: 6px;
     line-height: 1.4;
 }
+
+/* 面板内的运行日志：手机上打不开控制台，出问题只能靠截图这里 */
+.st-sync-panel .st-sync-logbox {
+    margin-top: 8px;
+    border: 1px solid var(--white30a, rgba(255, 255, 255, 0.15));
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.st-sync-panel .st-sync-loghead {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    font-size: 0.8em;
+    opacity: 0.75;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+}
+
+.st-sync-panel .st-sync-logcopy {
+    cursor: pointer;
+    text-decoration: underline;
+    white-space: nowrap;
+}
+
+.st-sync-panel .st-sync-log {
+    margin: 0;
+    padding: 6px 8px;
+    max-height: 11em;
+    overflow-y: auto;
+    font-size: 0.72em;
+    line-height: 1.45;
+    /* 手机上要能横向滚，日志行很长，自动折行反而看不清 */
+    white-space: pre;
+    overflow-x: auto;
+    word-break: normal;
+    background: rgba(0, 0, 0, 0.25);
+}

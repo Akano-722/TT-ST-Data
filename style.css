@@ -1,0 +1,66 @@
+.st-sync-panel .st-sync-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 10px;
+    align-items: center;
+    margin-top: 8px;
+}
+
+.st-sync-panel .st-sync-grid label {
+    white-space: nowrap;
+    opacity: 0.85;
+}
+
+.st-sync-panel .st-sync-grid input[type="text"],
+.st-sync-panel .st-sync-grid input[type="password"],
+.st-sync-panel .st-sync-grid input[type="number"],
+.st-sync-panel .st-sync-grid select {
+    width: 100%;
+}
+
+.st-sync-panel .st-sync-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 10px 0 6px;
+}
+
+.st-sync-panel .st-sync-status {
+    font-size: 0.9em;
+    line-height: 1.5;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.st-sync-panel .st-sync-status.is-error {
+    color: #ff8080;
+}
+
+.st-sync-panel .st-sync-status.is-ok {
+    color: #8fd98f;
+}
+
+/* 面板内的确认框：不用 window.confirm，见 index.js 里 askUser 的注释 */
+.st-sync-panel .st-sync-confirm {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid rgba(255, 190, 80, 0.55);
+    border-radius: 4px;
+    background: rgba(255, 180, 60, 0.12);
+}
+
+.st-sync-panel .st-sync-confirm-text {
+    font-size: 0.9em;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+
+.st-sync-panel .st-sync-hint {
+    font-size: 0.85em;
+    opacity: 0.65;
+    margin-top: 6px;
+    line-height: 1.4;
+}

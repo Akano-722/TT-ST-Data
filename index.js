@@ -12,6 +12,73 @@
 
 const LOG = '[ST-Sync]';
 
+/** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
+const EXT_VERSION = '2026-10-01.2';
+
+/**
+ * 日志也往面板里记一份。
+ *
+ * 手机上没有控制台，`console.debug` 打给人看等于没打 —— 出了事只能看到"点了没反应"，
+ * 一点线索都拿不到。所以同一个 log() 既进控制台也进面板，出问题直接截图面板就行。
+ */
+const LOG_MAX_LINES = 200;
+const LOG_LINES = [];
+/** 面板里默认只显示最后几行，剩下的点「复制全部」拿走 */
+const LOG_TAIL_LINES = 10;
+
+function logArg(a) {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error) return `${a.name}: ${a.message}`;
+    try { return JSON.stringify(a); } catch { return String(a); }
+}
+
+function log(...args) {
+    const line = args.map(logArg).join(' ');
+    try { console.debug(LOG, line); } catch { /* 控制台没了也得往下走 */ }
+    const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    LOG_LINES.push(`${stamp} ${line}`);
+    if (LOG_LINES.length > LOG_MAX_LINES) LOG_LINES.splice(0, LOG_LINES.length - LOG_MAX_LINES);
+    renderLog();
+}
+
+function logText() {
+    return LOG_LINES.join('\n');
+}
+
+function renderLog() {
+    if (!ui.log) return;
+    ui.log.textContent = LOG_LINES.slice(-LOG_TAIL_LINES).join('\n');
+    ui.log.scrollTop = ui.log.scrollHeight;
+}
+
+/** 手机上没法开控制台，所以日志得能拿走：优先剪贴板，不行就把全文摊开让用户长按选 */
+async function copyLog() {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(logText());
+            notify('success', `已复制 ${LOG_LINES.length} 行日志`);
+            return;
+        }
+        throw new Error('剪贴板不可用');
+    } catch {
+        // WebView 里的自定义协议通常不是安全上下文，navigator.clipboard 直接没有。
+        // 退而求其次：把完整日志摊进 <pre>（不再只显示尾巴）并全选，长按就能复制。
+        //
+        // 顺序不能反：notify 会顺手 log() 一行，而 log() 又会把面板刷成"只显示尾巴"，
+        // 先摊开再提示的话，刚摊开的全文和选区都会被自己刷掉。
+        notify('info', '剪贴板用不了，已把完整日志摊开，长按复制');
+        if (!ui.log) return;
+        ui.log.textContent = logText();
+        try {
+            const range = document.createRange();
+            range.selectNodeContents(ui.log);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        } catch { /* 选不中也无所谓，字摊开了就行 */ }
+    }
+}
+
 /* ------------------------------------------------------------------ *
  * 超时
  *
@@ -50,32 +117,48 @@ function timeoutError(what, timeoutMs) {
  *
  * 计时器一直留到 **body 读完** 才清，不是在拿到响应头时清 —— 卡住的正是读 body 那一步，
  * 头早就回来了。所以这里给 text/json/blob/arrayBuffer 包一层，读完（或读挂）才放计时器。
+ *
+ * 每步都记一行日志，状态栏也会实时显示"卡在哪一步、已经多久"，手机上不用开控制台就能看。
  */
 async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what = '请求' } = {}) {
     const controller = new AbortController();
     const started = Date.now();
+
+    // 状态栏跟着走：卡住时至少能看出是卡在哪一步、卡了多久
+    STATE.step = what;
+    renderStatus();
+
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     let res;
     try {
-        console.debug(LOG, `${what} 发出（超时 ${timeoutMs / 1000}s）：${url}`);
+        log(`${what} 发出（超时 ${timeoutMs / 1000}s）：${url}`);
         res = await fetch(url, { ...options, signal: controller.signal });
     } catch (err) {
         clearTimeout(timer);
-        if (isAbort(err)) throw timeoutError(what, timeoutMs);
+        if (isAbort(err)) {
+            log(`${what} 超时，用时 ${Date.now() - started}ms`);
+            throw timeoutError(what, timeoutMs);
+        }
+        log(`${what} 失败，用时 ${Date.now() - started}ms`, err);
         throw err;
     }
-    console.debug(LOG, `${what} 响应头到达：HTTP ${res.status}，用时 ${Date.now() - started}ms`);
+    log(`${what} 响应头到达：HTTP ${res.status}，用时 ${Date.now() - started}ms`);
 
     for (const method of ['text', 'json', 'blob', 'arrayBuffer']) {
         const original = res[method].bind(res);
         res[method] = async (...args) => {
             try {
                 const value = await original(...args);
-                console.debug(LOG, `${what} body 读完，总共 ${Date.now() - started}ms`);
+                log(`${what} body 读完，总共 ${Date.now() - started}ms`);
                 return value;
             } catch (err) {
-                if (isAbort(err)) throw timeoutError(what, timeoutMs);
+                if (isAbort(err)) {
+                    // 这个分支就是 TT 手机端卡死的形态：头回来了、body 永远不结束
+                    log(`${what} 读 body 超时（响应头 ${Date.now() - started}ms 前就到了），已中断`);
+                    throw timeoutError(what, timeoutMs);
+                }
+                log(`${what} 读 body 失败`, err);
                 throw err;
             } finally {
                 clearTimeout(timer);
@@ -93,10 +176,13 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
  *                            （users-private.js:146 读的正是 request.body.handle）
  *   GET  /api/users/me       取当前用户的 handle
  *
- * 恢复这一侧**没有**"上传 zip 还原"的接口 —— 1.18.0 里根本不存在这种路由
+ * 恢复这一侧原版 ST **没有**"上传 zip 还原"的接口 —— 1.18.0 里根本不存在这种路由
  * （/api/backups 下只有 chat/get、chat/delete、chat/download 三条，那是聊天记录备份，
- * 跟用户数据备份是两码事）。所以恢复改成了**按类写回**：把 zip 拆开，
- * 每一类数据用酒馆前端自己也在用的"保存"接口写回去，见下面的 RESTORE_KINDS。
+ * 跟用户数据备份是两码事）。所以那边只能**按类写回**：把 zip 拆开，每一类数据用
+ * 酒馆前端自己也在用的"保存"接口写回去，见下面的 writeXxx。
+ *
+ * TT 酒馆则自带整包导入，走 DM_API（见 restoreViaNativeImport）。
+ * 两条路怎么选见 pullOne。出处和依据都在 tools/tt-tavern-api.md。
  * ------------------------------------------------------------------ */
 const ST_API = {
     download: { method: 'POST', url: '/api/users/backup' },
@@ -144,6 +230,9 @@ const DEFAULT_SETTINGS = {
 const STATE = {
     busy: false,
     timer: null,
+    ticker: null,         // 忙的时候每秒刷一次状态栏，好让"已 N 秒"真的在走
+    busySince: 0,         // 这一轮是什么时候开始的
+    step: '',             // 当前卡在哪一步（timedFetch 每次请求都会更新）
     lastResult: '',
     lastOk: null,
     suppressDirty: false, // 恢复数据期间挂起改动检测，避免把恢复本身误判成用户改动
@@ -238,15 +327,39 @@ function notify(kind, message) {
     STATE.lastResult = message;
     // success 绿色、error 红色、info/warn 中性色
     STATE.lastOk = kind === 'success' ? true : (kind === 'error' ? false : null);
+    // 也进面板日志：手机上没有 toastr 或者弹窗一闪而过时，这里还能翻到
+    log(`[${kind}] ${message}`);
     renderStatus();
 
     const t = window.toastr;
-    if (!t) {
-        console.log(LOG, `[${kind}] ${message}`);
-        return;
-    }
+    if (!t) return;
     const fn = { success: t.success, info: t.info, warn: t.warning, error: t.error }[kind] || t.info;
     fn.call(t, message, '酒馆云同步');
+}
+
+/**
+ * 开始/结束一轮同步。
+ *
+ * 单独抽出来是因为状态栏要在忙的时候**每秒重画**：卡死时"已 137 秒"一直在涨，
+ * 比一个静止的"正在同步…"信息量大得多 —— 静止的分不出是卡住了还是马上就好。
+ */
+function beginBusy(what = '') {
+    STATE.busy = true;
+    STATE.busySince = Date.now();
+    STATE.step = what;
+    if (!STATE.ticker) STATE.ticker = setInterval(renderStatus, 1000);
+    renderStatus();
+}
+
+function endBusy() {
+    STATE.busy = false;
+    STATE.busySince = 0;
+    STATE.step = '';
+    if (STATE.ticker) {
+        clearInterval(STATE.ticker);
+        STATE.ticker = null;
+    }
+    renderStatus();
 }
 
 function renderStatus() {
@@ -255,8 +368,10 @@ function renderStatus() {
     if (STATE.restore) {
         // 恢复是几百个请求，得让人看见它在往前走，不然会以为卡死了
         parts.push(`⏳ 正在还原：${STATE.restore.label}　${STATE.restore.done}/${STATE.restore.total}`);
-    } else if (STATE.busy) parts.push('⏳ 正在同步…');
-    else if (STATE.lastResult) parts.push(STATE.lastResult);
+    } else if (STATE.busy) {
+        const secs = STATE.busySince ? Math.floor((Date.now() - STATE.busySince) / 1000) : 0;
+        parts.push(`⏳ ${STATE.step ? `${STATE.step}…` : '正在同步…'}　已 ${secs} 秒`);
+    } else if (STATE.lastResult) parts.push(STATE.lastResult);
 
     const s = settings();
     parts.push(`本机标识：${s.deviceId}　本地改动：${s.localDirty ? '有（未上传）' : '无'}`);
@@ -382,10 +497,10 @@ async function currentHandle() {
             const user = await res.json();
             handle = user && user.handle ? String(user.handle) : '';
         } else {
-            console.warn(LOG, `GET ${ST_API.me.url} 返回 HTTP ${res.status}，退回 default-user`);
+            log(`GET ${ST_API.me.url} 返回 HTTP ${res.status}，退回 default-user`);
         }
     } catch (err) {
-        console.warn(LOG, '取当前用户失败，退回 default-user', err);
+        log('取当前用户失败，退回 default-user', err);
     }
 
     cachedHandle = handle || 'default-user';
@@ -1204,7 +1319,7 @@ async function restoreFromZip(blob, { marker, fileName }) {
                 progress.done = [...done];
             } catch (err) {
                 // 单个文件失败不该让整次恢复前功尽弃：记下来接着写下一个，最后一次性报告
-                console.warn(LOG, `还原失败 ${task.name}`, err);
+                log(`还原失败 ${task.name}`, err);
                 skipped.push(`${task.name}：${err.message}`);
             }
 
@@ -1283,7 +1398,7 @@ async function restoreViaNativeImport(blob, fileName) {
         throw new Error(`酒馆没返回 job_id，导入没跑起来：${String(submitted.text || '').slice(0, 200)}`);
     }
 
-    console.debug(LOG, '导入任务已提交：', jobId);
+    log('导入任务已提交：', jobId);
     return waitForImportJob(jobId, fileName);
 }
 
@@ -1296,8 +1411,8 @@ async function waitForImportJob(jobId, fileName) {
             if (Date.now() > deadline) {
                 throw new Error(`导入等了 ${JOB_TIMEOUT_MS / 60000} 分钟还没结束，已放弃（酒馆那边可能还在跑）`);
             }
-            await sleep(JOB_POLL_INTERVAL_MS);
 
+            // 先查再睡（和酒馆自带的 data-migration 一个顺序），别白等一个间隔
             // 这里刻意不用 stMustOk：job 状态体在失败时**本身就带 `error` 字段**，
             // 而 stMustOk 一见 error 就当成"酒馆拒绝了这次请求"，会把失败原因吃掉。
             const res = await stFetch(`${DM_API.job}?id=${encodeURIComponent(jobId)}`, { method: 'GET' });
@@ -1311,7 +1426,7 @@ async function waitForImportJob(jobId, fileName) {
 
             if (job.stage && job.stage !== lastStage) {
                 lastStage = job.stage;
-                console.debug(LOG, `导入阶段：${job.stage}${job.message ? ` — ${job.message}` : ''}`);
+                log(`导入阶段：${job.stage}${job.message ? ` — ${job.message}` : ''}`);
             }
             const percent = Number(job.progress_percent);
             STATE.restore = {
@@ -1321,7 +1436,10 @@ async function waitForImportJob(jobId, fileName) {
             };
             renderStatus();
 
-            if (!TERMINAL_JOB_STATES.has(job.state)) continue;
+            if (!TERMINAL_JOB_STATES.has(job.state)) {
+                await sleep(JOB_POLL_INTERVAL_MS);
+                continue;
+            }
 
             if (job.state === 'completed') {
                 // 数据已经落盘了，但没对上账，得让下次同步重来一遍
@@ -1365,7 +1483,7 @@ async function readRemoteLatest(device) {
         if (!res.ok) return null;
         return await res.json();
     } catch (err) {
-        console.warn(LOG, `读 ${device} 的 latest.json 失败`, err);
+        log(`读 ${device} 的 latest.json 失败`, err);
         return null;
     }
 }
@@ -1524,8 +1642,7 @@ async function collectRemoteUpdates() {
  */
 async function syncNow() {
     if (STATE.busy) { notify('info', '正在同步中，请稍候'); return; }
-    STATE.busy = true;
-    renderStatus();
+    beginBusy('智能同步');
 
     try {
         requireConfig();
@@ -1545,11 +1662,10 @@ async function syncNow() {
         if (updates.length) { await pullUpdates(updates); return; }
         await pushToRelay();
     } catch (err) {
-        console.error(LOG, err);
+        log('同步出错', err);
         notify('error', err.message);
     } finally {
-        STATE.busy = false;
-        renderStatus();
+        endBusy();
     }
 }
 
@@ -1557,20 +1673,18 @@ async function syncNow() {
 async function pushIfDirty() {
     if (STATE.busy) return;
     if (!isDirty()) {
-        console.debug(LOG, '定时检查：本机没有改动，跳过');
+        log('定时检查：本机没有改动，跳过');
         return;
     }
-    STATE.busy = true;
-    renderStatus();
+    beginBusy('定时备份');
     try {
         requireConfig();
         await pushToRelay();
     } catch (err) {
-        console.error(LOG, err);
+        log('定时备份出错', err);
         notify('error', `定时备份失败：${err.message}`);
     } finally {
-        STATE.busy = false;
-        renderStatus();
+        endBusy();
     }
 }
 
@@ -1668,6 +1782,14 @@ const PANEL_HTML = `
 
       <div id="st_sync_status" class="st-sync-status">未同步</div>
 
+      <div class="st-sync-logbox">
+        <div class="st-sync-loghead">
+          <span>运行日志（手机上出问题就截图这里）</span>
+          <span id="st_sync_log_copy" class="st-sync-logcopy">复制全部</span>
+        </div>
+        <pre id="st_sync_log" class="st-sync-log"></pre>
+      </div>
+
       <div id="st_sync_confirm" class="st-sync-confirm" style="display: none;">
         <div id="st_sync_confirm_text" class="st-sync-confirm-text"></div>
         <div class="st-sync-buttons">
@@ -1682,6 +1804,10 @@ const PANEL_HTML = `
         <b>使用期间</b>：按上面设定的间隔自动上传（只传不拉，不会打断你聊天）。<br />
         恢复方式：<span id="st_sync_restore_mode">（加载中…）</span>。<br />
         两边都改过时会先问你，不会闷头覆盖。
+      </div>
+
+      <div class="st-sync-hint">
+        版本 <b id="st_sync_version">?</b>　—　点完「更新」后确认这里变了，没变就是没更上（要硬刷新/重开 App）
       </div>
     </div>
   </div>
@@ -1724,11 +1850,19 @@ function askUser(message, okLabel = '确定', cancelLabel = '取消') {
         ui.confirmOk.text('').text(okLabel);
         ui.confirmCancel.text('').text(cancelLabel);
         ui.confirmBox.show();
+        // 确认框要是滚出可视区了，看起来就跟"点了没反应"一模一样。
+        // 状态栏先喊一声，至少让人知道还差一步。
+        ui.confirmBox[0]?.scrollIntoView?.({ block: 'nearest' });
+        STATE.lastResult = `⚠️ 等你确认：点下面的「${okLabel}」`;
+        STATE.lastOk = null;
+        renderStatus();
 
         const finish = (value) => {
             ui.confirmBox.hide();
             ui.confirmOk.off('click');
             ui.confirmCancel.off('click');
+            STATE.lastResult = '';
+            renderStatus();
             resolve(value);
         };
         ui.confirmOk.on('click', () => finish(true));
@@ -1741,11 +1875,18 @@ function buildUI() {
     ui = {
         status: document.getElementById('st_sync_status'),
         restoreMode: document.getElementById('st_sync_restore_mode'),
+        log: document.getElementById('st_sync_log'),
+        logCopy: document.getElementById('st_sync_log_copy'),
+        version: document.getElementById('st_sync_version'),
         confirmBox: $('#st_sync_confirm'),
         confirmText: $('#st_sync_confirm_text'),
         confirmOk: $('#st_sync_confirm_ok'),
         confirmCancel: $('#st_sync_confirm_cancel'),
     };
+
+    if (ui.version) ui.version.textContent = EXT_VERSION;
+    if (ui.logCopy) $(ui.logCopy).on('click', copyLog);
+    renderLog();   // 面板晚于最早那几条日志建好，把之前记下的补画上去
 
     bindField('#st_sync_relay', 'relayUrl');
     bindField('#st_sync_token', 'token');
@@ -1764,21 +1905,25 @@ function buildUI() {
     $('#st_sync_btn_test').on('click', testConnection);
 
     $('#st_sync_btn_push').on('click', async () => {
+        // 点一下就得有痕迹：手机上"什么都没发生"最难查，先落一行再说
+        log('点击「上传到中转」');
         if (STATE.busy) { notify('info', '正在忙，等当前操作结束'); return; }
         const go = await askUser('把本机数据打包上传到中转？只会新增一个快照，不动本机数据。', '上传', '取消');
+        log(`确认框：${go ? '确认上传' : '已取消'}`);
         if (!go) return;
-        STATE.busy = true; renderStatus();
+        beginBusy('打包上传');
         try {
             requireConfig();
             await pushToRelay();
         } catch (err) {
             notify('error', err.message);
         } finally {
-            STATE.busy = false; renderStatus();
+            endBusy();
         }
     });
 
     $('#st_sync_btn_pull').on('click', async () => {
+        log('点击「从中转恢复」');
         if (STATE.busy) { notify('info', '正在忙，等当前操作结束'); return; }
         try {
             requireConfig();
@@ -1811,27 +1956,30 @@ function buildUI() {
             '开始还原',
             '取消',
         );
+        log(`确认框：${go ? '确认还原' : '已取消'}`);
         if (!go) return;
 
-        STATE.busy = true; renderStatus();
+        beginBusy('还原');
         try {
             await pullUpdates([{ device: other, latest }]);
         } catch (err) {
             notify('error', err.message);
         } finally {
-            STATE.busy = false; renderStatus();
+            endBusy();
         }
     });
 
-    $('#st_sync_btn_sync').on('click', () => syncNow());
+    $('#st_sync_btn_sync').on('click', () => {
+        log('点击「智能同步」');
+        syncNow();
+    });
 
     renderStatus();
 }
 
 async function testConnection() {
     if (STATE.busy) { notify('info', '正在忙，等当前操作结束'); return; }
-    STATE.busy = true;
-    renderStatus();
+    beginBusy('测试连接');
     try {
         requireConfig();
         const res = await relayFetch('/v1/meta');
@@ -1842,8 +1990,7 @@ async function testConnection() {
     } catch (err) {
         notify('error', err.message);
     } finally {
-        STATE.busy = false;
-        renderStatus();
+        endBusy();
     }
 }
 
@@ -1922,6 +2069,12 @@ async function init() {
     subscribeEvents();
     restartTimer();
 
+    // 这行最先要看到：确认手机上跑的到底是哪一版。update 之后没变就是没更上。
+    log(`扩展已加载，版本 ${EXT_VERSION}`);
+    log(`origin=${location.origin}　运行时=${isTauriTavern() ? 'TT 酒馆' : '原版 ST'}`
+        + `　AbortController=${typeof AbortController === 'function' ? '有' : '没有！'}`
+        + `　fetch=${typeof fetch === 'function' ? '有' : '没有！'}`);
+
     const s = settings();
     if (s.checkOnLoad && String(s.relayUrl || '').trim() && String(s.token || '').trim()) {
         console.debug(LOG, '打开页面，检查云端最新备份是本地还是对面的');
@@ -1930,7 +2083,6 @@ async function init() {
         syncNow();
     }
 
-    console.log(LOG, '扩展已加载');
 }
 
 jQuery(async () => {

@@ -58,6 +58,8 @@ const EXPORTS = [
     'EXT_VERSION', 'log', 'LOG_LINES', 'LOG_MAX_LINES', 'logText', 'beginBusy', 'endBusy',
     // 上传绕行：拼 zip + 逐类读
     'buildZip', 'crc32', 'ZipReader', 'collectTtEntries', 'buildTtBackup', 'TT_API', 'TT_NO_READ_API',
+    // 云侧的分类，用来验"上传拼出来的目录名云侧认不认"
+    'classifyRestoreEntry',
 ];
 
 /**
@@ -648,7 +650,35 @@ function makeTtReadFetch({ imageType = 'image/png' } = {}) {
         if (url.includes('/api/users/backup')) throw new Error('TT 分叉不该再去下载备份');
 
         if (url.includes('/api/settings/get')) {
-            return json({ theme: 'dark', username: 'u', world_names: ['WorldA', 'Bad/Name'] });
+            // TT 回的是套壳：settings 本体是**字符串**，其余是平铺的兄弟字段。
+            // 形状照 Rust 侧 SillyTavernSettingsResponseDto 抄，别自己发明。
+            return json({
+                settings: JSON.stringify({
+                    username: 'u',
+                    theme: 'dark',
+                    power_user: {
+                        personas: { 'me.png': '我' },
+                        persona_descriptions: { 'me.png': { description: '人设正文' } },
+                    },
+                }),
+                world_names: ['WorldA', 'Bad/Name'],
+                themes: [{ name: '暗色主题', main_text_color: '#fff' }, { name: 'Bad/Name' }],
+                movingUIPresets: [{ name: '布局A' }],
+                quickReplyPresets: [{ name: '快捷集', qrList: [] }],
+                context: [{ name: '上下文预设', story_string: 'x' }],
+                instruct: [{ name: '指令预设' }],
+                sysprompt: [{ name: '系统提示' }],
+                reasoning: [{ name: '推理模板' }],
+                // 平行的「内容 + 名字」数组里，内容是该文件的原始 JSON 文本
+                koboldai_settings: ['{"name":"K预设","temp":0.5}'],
+                koboldai_setting_names: ['K预设'],
+                novelai_settings: ['{"name":"N预设"}', '这不是 JSON'],
+                novelai_setting_names: ['N预设', '坏预设'],
+                openai_settings: ['{"name":"O预设"}'],
+                openai_setting_names: ['O预设'],
+                textgenerationwebui_presets: ['{"name":"T预设"}'],
+                textgenerationwebui_preset_names: ['T预设'],
+            });
         }
         if (url.includes('/api/characters/all')) {
             return json([
@@ -679,9 +709,21 @@ function makeTtReadFetch({ imageType = 'image/png' } = {}) {
             return json({ entries: { e1: { key: ['k'], content: '世界书正文' } } });
         }
         if (url.includes('/api/backgrounds/all')) {
-            return json({ images: ['bg1.jpg', 'folder/bg2.png', 'https://cdn.example/x.png'] });
+            // 真机上 images[] 的元素是**对象** {filename,isAnimated}；字符串形状也混一条进来，
+            // 加上一条外链、一条没有 filename 的脏数据 —— 三种都得扛住。
+            return json({
+                images: [
+                    { filename: 'bg1.jpg', isAnimated: false },
+                    'folder/bg2.png',
+                    { filename: 'https://cdn.example/x.png', isAnimated: false },
+                    { isAnimated: true },
+                ],
+            });
         }
-        if (url.includes('/api/avatars/get')) return json(['me.png']);
+        if (url.includes('/api/avatars/get')) {
+            // 真机上是字符串数组，顺手混一条对象形状：别再赌形状
+            return json(['me.png', { filename: 'other.png' }]);
+        }
 
         // 图片字节：TT 那边是前端相对路径，不是 /api/...
         if (url.startsWith('backgrounds/') || url.startsWith('User Avatars/')) {
@@ -732,17 +774,69 @@ async function testTtBackupBuild(bad_) {
         'backgrounds/bg1.jpg',
         'backgrounds/folder/bg2.png',
         'User Avatars/me.png',
+        // 预设类：全都来自 /api/settings/get 的兄弟字段，目录名必须和云侧对得上
+        'themes/暗色主题.json',
+        'movingUI/布局A.json',
+        'QuickReplies/快捷集.json',
+        'context/上下文预设.json',
+        'instruct/指令预设.json',
+        'sysprompt/系统提示.json',
+        'reasoning/推理模板.json',
+        'KoboldAI Settings/K预设.json',
+        'NovelAI Settings/N预设.json',
+        'OpenAI Settings/O预设.json',
+        'TextGen Settings/T预设.json',
         'settings.json',
     ];
     const missing = wanted.filter((n) => !names.includes(n));
     if (missing.length) bad('该进包的条目少了', `缺 ${JSON.stringify(missing)}；实际 ${JSON.stringify(names)}`);
-    else ok(`条目齐了（${names.length} 条）：角色卡/聊天/群组/群聊/世界书/图片/设置`);
+    else ok(`条目齐了（${names.length} 条）：角色卡/聊天/群组/群聊/世界书/预设/图片/设置`);
 
     // 不该进包的
-    const unwanted = ['characters/Bad/Name.png', 'worlds/Bad/Name.json', 'group chats/gc2.jsonl'];
+    const unwanted = [
+        'characters/Bad/Name.png', 'worlds/Bad/Name.json', 'group chats/gc2.jsonl',
+        'themes/Bad/Name.json',      // 名字里带斜杠的主题
+        'NovelAI Settings/坏预设.json', // 内容是坏 JSON，塞进去只会让这一类恢复整个失败
+        'backgrounds/[object Object]', // 老 bug：把对象当字符串拼
+    ];
     const leaked = unwanted.filter((n) => names.includes(n));
     if (leaked.length) bad('不该进包的条目混进来了', JSON.stringify(leaked));
-    else ok('边角料都挡住了（带斜杠的名字、读不出来的群聊）');
+    else ok('边角料都挡住了（带斜杠的名字、坏 JSON、读不出来的群聊）');
+
+    // 预设的正文要能直接被云侧 stParseJson 读回来
+    const theme = await readZipEntry(reader, 'themes/暗色主题.json');
+    let themeJson = null;
+    try { themeJson = JSON.parse(theme.toString('utf8')); } catch { /* 下面统一报 */ }
+    if (themeJson && themeJson.name === '暗色主题' && themeJson.main_text_color === '#fff') {
+        ok('主题按内容原样落盘（云侧 writeTheme 拿 .name 当名字）');
+    } else {
+        bad('主题内容不对', theme ? theme.toString('utf8').slice(0, 120) : '（没读到）');
+    }
+
+    const openai = await readZipEntry(reader, 'OpenAI Settings/O预设.json');
+    let openaiJson = null;
+    try { openaiJson = JSON.parse(openai.toString('utf8')); } catch { /* 下面统一报 */ }
+    if (openaiJson && openaiJson.name === 'O预设') {
+        ok('AI 预设按平行数组配对（内容取 settings[i]，名字取 names[i]）');
+    } else {
+        bad('AI 预设内容不对', openai ? openai.toString('utf8').slice(0, 120) : '（没读到）');
+    }
+
+    // 设置本体：必须是 settings 字符串**解开之后**的那份，不能是套壳
+    const settingsEntry = await readZipEntry(reader, 'settings.json');
+    let settingsJson = null;
+    try { settingsJson = JSON.parse(settingsEntry.toString('utf8')); } catch { /* 下面统一报 */ }
+    if (!settingsJson) {
+        bad('settings.json 不是合法 JSON', settingsEntry ? settingsEntry.toString('utf8').slice(0, 120) : '（没读到）');
+    } else if (settingsJson.settings !== undefined || settingsJson.world_names !== undefined) {
+        bad('settings.json 写进去的是整个套壳', '云侧恢复出来 power_user 会不存在，人设名字/描述全丢');
+    } else if (settingsJson.username !== 'u'
+        || settingsJson.power_user?.personas?.['me.png'] !== '我'
+        || settingsJson.power_user?.persona_descriptions?.['me.png']?.description !== '人设正文') {
+        bad('settings.json 里没有解开后的 power_user', JSON.stringify(settingsJson).slice(0, 200));
+    } else {
+        ok('settings.json 是解开后的本体（power_user.personas / persona_descriptions 都在）');
+    }
 
     if (names[names.length - 1] !== 'settings.json') {
         bad('settings.json 不在最后', `最后一条是 ${names[names.length - 1]}`);
@@ -794,7 +888,7 @@ async function testTtBackupBuild(bad_) {
     // 手机上唯一的线索就是面板日志：分类计数和"跳过了什么"必须落进去
     const text = lines.join('\n');
     // 角色卡是 1 张不是 2 张：名字里带斜杠的那张在进包前就被挡掉了
-    const needed = ['角色卡 1 张', '世界书 1/2 本', '跳过预设', '跳过主题', '跳过聊天附件'];
+    const needed = ['角色卡 1 张', '世界书 1/2 本', '预设/主题 11/13 条', '跳过图片', '跳过聊天附件'];
     for (const need of needed) {
         if (!text.includes(need)) bad(`日志里没有「${need}」`, '手机上看不到这一步的进展/缺口');
     }
@@ -803,7 +897,50 @@ async function testTtBackupBuild(bad_) {
     }
 }
 
-/** TT 上没有读接口的类（图片/附件/预设…）跳过就行，但不能连累 Tier1 的数据 */
+/**
+ * 上传侧拼出来的目录名，云侧 `classifyRestoreEntry` 必须认得出。
+ *
+ * 这一条是"端到端契约"的钉子：两边单独看都自洽，但目录名对不上就是静默丢数据 ——
+ * 云侧会把整个条目当成"不认识"直接跳过，日志上什么都看不出来。
+ */
+async function testPresetEntriesClassify(bad_) {
+    console.log('\n── 预设类条目：云侧认不认 ──');
+    const { api } = loadExtension({ fetchImpl: async () => json({}) });
+
+    // [条目名, 期望的 kind, 期望的 apiId（预设才有，决定往哪个目录写）]
+    const expect = [
+        ['themes/暗色主题.json', 'theme', null],
+        ['movingUI/布局A.json', 'movingUI', null],
+        ['QuickReplies/快捷集.json', 'quickReply', null],
+        ['context/上下文预设.json', 'preset', 'context'],
+        ['instruct/指令预设.json', 'preset', 'instruct'],
+        ['sysprompt/系统提示.json', 'preset', 'sysprompt'],
+        ['reasoning/推理模板.json', 'preset', 'reasoning'],
+        ['KoboldAI Settings/K预设.json', 'preset', 'kobold'],
+        ['NovelAI Settings/N预设.json', 'preset', 'novel'],
+        ['OpenAI Settings/O预设.json', 'preset', 'openai'],
+        ['TextGen Settings/T预设.json', 'preset', 'textgenerationwebui'],
+        // 老样子也得还认
+        ['backgrounds/bg1.jpg', 'background', null],
+        ['User Avatars/me.png', 'userAvatar', null],
+        ['settings.json', 'settings', null],
+    ];
+
+    const wrong = [];
+    for (const [name, kind, apiId] of expect) {
+        const info = api.classifyRestoreEntry(name);
+        if (!info || info.kind !== kind) {
+            wrong.push(`${name} → ${info ? info.kind : 'null'}（期望 ${kind}）`);
+            continue;
+        }
+        if (apiId && info.apiId !== apiId) wrong.push(`${name} → apiId ${info.apiId}（期望 ${apiId}）`);
+    }
+
+    if (wrong.length) bad('云侧认不出来的条目', wrong.join('；'));
+    else ok(`预设/主题/快捷回复/界面布局 + 老几类，云侧全都认（${expect.length} 条）`);
+}
+
+/** TT 上没有读接口的类（图片/附件）跳过就行，但不能连累 Tier1 的数据 */
 async function testTtImagesWithoutBytes(bad_) {
     console.log('\n── 上传绕行：图片取不到字节时 ──');
     // TT 后端没有"按路径读图片"的 HTTP 接口，取回来的很可能是前端页面（200 + text/html）
@@ -981,6 +1118,7 @@ async function main() {
     await testDiagnostics(bad);
     await testZipWriter(bad);
     await testTtBackupBuild(bad);
+    await testPresetEntriesClassify(bad);
     await testTtImagesWithoutBytes(bad);
     await testClassicStaysOnBackupApi(bad);
 

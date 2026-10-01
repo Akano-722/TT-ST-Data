@@ -218,7 +218,7 @@ GET /api/extensions/data-migration/job?id=<job_id>
 
 | 类 | 读接口 | 状态 |
 |---|---|---|
-| settings | `/api/settings/get` → **整份 settings.json**，注意里面带 `world_names` | ✅ |
+| settings | `/api/settings/get` → **是个套壳**（Rust 侧 `SillyTavernSettingsResponseDto`）：settings 本体被序列化成**字符串**放在 `.settings` 里，要 `JSON.parse` 才是 settings.json；`world_names` 和下面那一堆预设全是它的**兄弟字段** | ✅ |
 | characters | `/api/characters/all`（列表，`.avatar` 是真实文件名）+ `/api/characters/export`（body `{avatar_url, format:'png'}` → **原始字节** Response） | ✅ 可字节保真 |
 | chats | `/api/characters/chats`（body `{avatar_url}` → `[{file_id, file_name}]`）+ `/api/chats/get`（body `{avatar_url, file_name}` → **消息对象数组**，不是 JSONL） | ✅ |
 | group chats | `/api/groups/all` 里每个组的 `.chats` 就是群聊 id 列表 + `/api/chats/group/get`（body `{id}` → 消息数组） | ✅ |
@@ -226,14 +226,27 @@ GET /api/extensions/data-migration/job?id=<job_id>
 | worlds | 名字**只在** `/api/settings/get` 的 `world_names` 里（没有"列世界书"的接口）→ `/api/worldinfo/get`（body `{name}`） | ✅ |
 | backgrounds | `/api/backgrounds/all` → `{images, config}`；`images` 的元素是 **`{filename, isAnimated}` 对象**（也可能直接是字符串，前端两种都认），**只有名字、没有字节** | ⚠️ 见下 |
 | avatars | `/api/avatars/get` → **名字数组**，也没有字节 | ✅ 真机可取到字节，见下 |
+| presets / themes / quick-replies / movingUI | 各有 save/delete 却**都没有 list** —— 但它们**全都平铺在 `/api/settings/get` 响应的兄弟字段上**（见下面那张表），所以照读不误 | ✅ 走 settings/get |
 | images | 只有 `/api/images/list`，**没有取字节的接口** | ❌ |
 | files | **完全没有读接口**（只有 upload/delete/verify/sanitize） | ❌ |
-| presets | 只有 save/delete/restore，**没有 list** | ❌ |
-| themes | 只有 save/delete | ❌ |
-| quick-replies | 只有 save/delete（外加 `/savequickreply` 老式路由） | ❌ |
-| movingUI | 没有 | ❌ |
 
-❌ 的那几类在 TT 上**读不出来**，实现里直接跳过并在面板日志里点名（`TT_NO_READ_API`，用户已同意「尽力而为」）。
+❌ 的那两类在 TT 上**读不出来**，实现里直接跳过并在面板日志里点名（`TT_NO_READ_API`，用户已同意「尽力而为」）。
+
+**预设类不需要新接口** —— Rust 侧 `build_sillytavern_settings_response`（`tt-application/src/services/settings_service.rs`）会挨个目录读盘再塞进 `/api/settings/get` 的响应：
+
+| 响应字段 | 形状 | 对应落盘目录（= 我们要落的 zip 目录） |
+|---|---|---|
+| `themes` | 对象数组，名字在 `.name` | `themes/` |
+| `movingUIPresets` | 对象数组 | `movingUI/` |
+| `quickReplyPresets` | 对象数组 | `QuickReplies/` |
+| `instruct` / `context` / `sysprompt` / `reasoning` | 对象数组 | 同名目录 |
+| `koboldai_settings` + `koboldai_setting_names` | **内容 + 名字两个平行数组**（内容是文件的原始 JSON 文本） | `KoboldAI Settings/` |
+| `novelai_settings` + `novelai_setting_names` | 同上 | `NovelAI Settings/` |
+| `openai_settings` + `openai_setting_names` | 同上 | `OpenAI Settings/` |
+| `textgenerationwebui_presets` + `textgenerationwebui_preset_names` | 同上 | `TextGen Settings/` |
+
+这些目录名和云侧 `PRESET_DIRECTORIES` / `classifyRestoreEntry` 一模一样，所以拼进 zip 后云侧一行都不用改。
+（Rust 里另有 `list_presets` / `get_preset` 命令，但**没挂 HTTP 路由**，扩展够不着，用不上。）
 
 ### ⚠️ 背景图 / 用户头像：TT 没有"按路径读字节"的 HTTP 接口
 
@@ -255,10 +268,25 @@ GET /api/extensions/data-migration/job?id=<job_id>
   真实 URL 形式是 `backgrounds/<filename>`，**不编码**（`getBackgroundPath()`，`backgrounds.js:377-380`；编码版那个是缩略图用的）。
   **好消息**：那个 404 说明 `backgrounds/*` 是**被真正路由的**（不是落到前端页面回 200 + text/html），所以名字修对之后大概率能取到 —— 但还是要在真机上确认。
 
-**两个待观察：**
-- **141 MB 的包可能把中转 PUT 撑爆超时**：`relayPut` 挂的是 `TIMEOUT_MS.relay = 60s`，而手机上行传 141 MB 很可能超过 60 秒 → 会被客户端自己 abort 掉。日志最后一行停在 `中转 PUT … 发出`，**结果未知**（用户截断了）。先看 relay 后台有没有收到那条 PUT、以及面板有没有报"中转 PUT 超时"。
-  若确实是超时：上传要单独给一个大得多的超时（或改成"按字节进度算超时"），不能和普通的 `GET /v1/meta` 共用一个 60s。
+**待观察（已结清）：**
+- ~~141 MB 的包可能把中转 PUT 撑爆超时~~ → **PUT 是 success**，`TIMEOUT_MS.relay = 60s` 够用，不用改。事后看是虚惊。
 - 141 MB 也不小 —— 恢复侧要几百个请求，云侧"从中转恢复"的耗时要实测。
+
+### 🔧 云侧恢复暴露的两个 bug（2026-10-01.4 修）
+
+云侧（原版 ST）从中转恢复之后，出现了两个症状，根因是同一个 —— **`/api/settings/get` 回的是套壳，我们却把整个套壳当 settings.json 写进了包**：
+
+1. **用户设定只有一个头像，名字和描述全空。** 人设的**条目**来自 `User Avatars/` 目录（那个类上传是好的，所以数量对），但名字和描述来自 `settings.json` 的 `power_user.personas` / `power_user.persona_descriptions` —— 套壳里根本没有 `power_user`，于是全空。
+   出处：TT 侧 `insert_personas`（`tt-domain/src/models/persona.rs:52-68`）把 persona 写进 settings 字符串的这两个键；云侧 `writeSettings` 是**原样**写 settings.json 的，所以写错就全错。
+   修法：`ttSettingsBody()` 取 `.settings` 再 `JSON.parse`。
+2. **预设 / 主题全没了。** 它们不在 settings 字符串里，而是套壳的**兄弟字段**（上面那张表），得单独拆成 `themes/<name>.json`、`OpenAI Settings/<name>.json` 这些条目。修法：`collectTtPresets()`。
+
+同时修掉的还有真机首跑发现的**背景图 28 张全 404**：`/api/backgrounds/all` 的 `images[]` 元素是对象，取 `.filename`（`ttBackgroundName`，对齐 `backgrounds.js:119` 的 `normalizeSystemBackgroundEntry`）。
+
+**图片 URL 的编码方式**：改成**逐段** `encodeURIComponent`（`ttImageUrl`）。原先写的"不编码"要收回半句 —— TT 自己的 `getBackgroundPath()` 兜底走的就是 `encodeURIComponent`（`backgrounds.js:370`），而且真机上 `User Avatars/<名字>` 用编码也是 25/25 全中，说明服务端会解开；但背景图可能在子目录里，整段编码会把 `/` 也编掉，所以按段编码两头都占。
+（`getBackgroundPath()` 上面还有个 `window.__TAURITAVERN_BACKGROUND_PATH__` 钩子，是 Tauri 注入的、我们拿不到，只能走相对路径这一条。）
+
+**测试**：`tools/sync-restore-test/run.js` 加了三条钉子 —— 背景图夹具混进「对象 / 字符串 / 外链 / 脏数据」四种；`settings.json` 必须等于**解开后**的本体、且不含 `settings`/`world_names` 这类套壳键；以及新条目拿云侧 `classifyRestoreEntry` 反查，断言 kind 和 apiId 都对得上（目录名对不上 = 静默丢数据，不看这条根本发现不了）。
 
 ### 拼 zip 的关键约束（从云侧 restore 反推，别踩）
 

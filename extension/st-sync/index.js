@@ -13,6 +13,79 @@
 const LOG = '[ST-Sync]';
 
 /* ------------------------------------------------------------------ *
+ * 超时
+ *
+ * 每个 fetch 都必须有超时，这不是"防御性编程"，是 TT 手机端实测出来的硬需求：
+ * 消费 `POST /api/users/backup` 那个带 `Content-Disposition: attachment` 的大二进制流时，
+ * 移动端 WebView 里的 fetch promise 可能**永远不 settle**（见 tools/tt-tavern-api.md 第 3 节）。
+ * 没有超时的话 STATE.busy 卡在 true，状态栏永远"正在同步"，之后点什么都只回"正在忙"——
+ * 整个扩展看起来就是死了。有超时，最坏也只是这一次同步失败，界面还能用。
+ * ------------------------------------------------------------------ */
+const TIMEOUT_MS = {
+    relay: 60 * 1000,
+    st: 60 * 1000,
+    // 服务端要先把自己几百 MB 的数据打包成 zip 才开始回包，比普通请求慢得多
+    backup: 180 * 1000,
+};
+
+/** 超时是我们自己掐断的，跟"网络连不上"是两回事，上层要分开报错 */
+function isAbort(err) {
+    return !!err && (err.name === 'AbortError' || err.code === 20);
+}
+
+function timeoutError(what, timeoutMs) {
+    const seconds = timeoutMs / 1000;
+    // 不取整：测试里挂的是几百毫秒，取整会变成"0 秒没有响应"
+    const shown = Number.isInteger(seconds) ? seconds : seconds.toFixed(1);
+    const err = new Error(`${what} 超时：${shown} 秒没有响应，已中断`);
+    err.isTimeout = true;
+    return err;
+}
+
+/**
+ * 带超时的 fetch。
+ *
+ * 用 AbortController 而不是 Promise.race：race 只是"我不等了"，请求其实还挂在后台、
+ * 连接不断；abort 才是真把这条连接掐掉。
+ *
+ * 计时器一直留到 **body 读完** 才清，不是在拿到响应头时清 —— 卡住的正是读 body 那一步，
+ * 头早就回来了。所以这里给 text/json/blob/arrayBuffer 包一层，读完（或读挂）才放计时器。
+ */
+async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what = '请求' } = {}) {
+    const controller = new AbortController();
+    const started = Date.now();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res;
+    try {
+        console.debug(LOG, `${what} 发出（超时 ${timeoutMs / 1000}s）：${url}`);
+        res = await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+        clearTimeout(timer);
+        if (isAbort(err)) throw timeoutError(what, timeoutMs);
+        throw err;
+    }
+    console.debug(LOG, `${what} 响应头到达：HTTP ${res.status}，用时 ${Date.now() - started}ms`);
+
+    for (const method of ['text', 'json', 'blob', 'arrayBuffer']) {
+        const original = res[method].bind(res);
+        res[method] = async (...args) => {
+            try {
+                const value = await original(...args);
+                console.debug(LOG, `${what} body 读完，总共 ${Date.now() - started}ms`);
+                return value;
+            } catch (err) {
+                if (isAbort(err)) throw timeoutError(what, timeoutMs);
+                throw err;
+            } finally {
+                clearTimeout(timer);
+            }
+        };
+    }
+    return res;
+}
+
+/* ------------------------------------------------------------------ *
  * 酒馆接口清单（都在 1.18.0 源码里逐个核对过，出处写在对应实现旁边）
  *
  * 上传这一侧只有两个：
@@ -227,8 +300,13 @@ async function relayFetch(pathname, options = {}) {
     headers.Authorization = `Bearer ${s.token}`;
     const base = String(s.relayUrl).replace(/\/+$/, '');
     try {
-        return await fetch(base + pathname, { ...options, headers });
+        return await timedFetch(base + pathname, { ...options, headers }, {
+            timeoutMs: TIMEOUT_MS.relay,
+            what: `中转 ${options.method || 'GET'} ${pathname}`,
+        });
     } catch (err) {
+        // 超时已经说清楚了是超时，别再包成"连不上"
+        if (err && err.isTimeout) throw err;
         throw new Error(`连不上中转服务（${err.message}）。检查地址是否正确、服务是否在跑、是否被跨域拦住`);
     }
 }
@@ -295,7 +373,11 @@ async function currentHandle() {
 
     let handle = '';
     try {
-        const res = await fetch(ST_API.me.url, { headers: ctx().getRequestHeaders() });
+        const res = await timedFetch(
+            ST_API.me.url,
+            { headers: ctx().getRequestHeaders() },
+            { timeoutMs: TIMEOUT_MS.st, what: '取当前用户' },
+        );
         if (res.ok) {
             const user = await res.json();
             handle = user && user.handle ? String(user.handle) : '';
@@ -312,10 +394,13 @@ async function currentHandle() {
 
 async function buildLocalBackup() {
     const handle = await currentHandle();
-    const res = await fetch(ST_API.download.url, {
+    const res = await timedFetch(ST_API.download.url, {
         method: ST_API.download.method,
         headers: ctx().getRequestHeaders(),
         body: JSON.stringify({ handle }),
+    }, {
+        timeoutMs: TIMEOUT_MS.backup,
+        what: '酒馆生成备份',
     });
     if (!res.ok) {
         // 服务端出错时回的是 JSON（比如 {"error":"Missing required fields"}），
@@ -762,8 +847,11 @@ class ZipReader {
  *     所以角色卡必须先落地，否则聊天会全部对不上号。settings.json 放最后。
  * ==================================================================== */
 
-/** 酒馆接口的通用调用。multipart 时不能带 Content-Type，否则浏览器补不上 boundary。 */
-async function stFetch(url, { json, multipart } = {}) {
+/**
+ * 酒馆接口的通用调用。multipart 时不能带 Content-Type，否则浏览器补不上 boundary。
+ * method 只有 data-migration 的 job 查询要用 GET，其余全是 POST。
+ */
+async function stFetch(url, { json, multipart, method = 'POST' } = {}) {
     const headers = { ...ctx().getRequestHeaders() };
     let body;
     if (multipart) {
@@ -773,7 +861,10 @@ async function stFetch(url, { json, multipart } = {}) {
     } else if (json !== undefined) {
         body = JSON.stringify(json);
     }
-    return fetch(url, { method: 'POST', headers, body });
+    return timedFetch(url, { method, headers, body }, {
+        timeoutMs: TIMEOUT_MS.st,
+        what: `酒馆 ${method} ${url}`,
+    });
 }
 
 /**
@@ -1131,6 +1222,120 @@ async function restoreFromZip(blob, { marker, fileName }) {
     return { written, skipped, alreadyDone, total: tasks.length, fileName };
 }
 
+/* ------------------------------------------------------------ TT 原生整包导入 */
+
+/**
+ * 是不是 TT 酒馆（Tauri/Rust 重写版）。
+ * 出处：TT 源码 docs/API/Migration.md —— `if (window.__TAURITAVERN__)`。原版 ST 这里是 undefined。
+ */
+function isTauriTavern() {
+    return !!window.__TAURITAVERN__;
+}
+
+/**
+ * 恢复方式的说明文案。
+ * 两条路的语义不一样，不能拿"按类写回"那套保证去描述原生整包导入 ——
+ * 后端怎么合并是它的事，我们只知道它接受了这份包。
+ */
+function restoreModeHint() {
+    return isTauriTavern()
+        ? '交给酒馆原生的「数据迁移」整包导入，由酒馆后端自己拆包落盘'
+        : '按类把对面的数据写回本机，同名覆盖';
+}
+
+const DM_API = {
+    import: '/api/extensions/data-migration/import',
+    job: '/api/extensions/data-migration/job',
+};
+
+const JOB_POLL_INTERVAL_MS = 1200;     // 官方前端 JOB_POLL_INTERVAL_MS 就是这个值
+const JOB_TIMEOUT_MS = 15 * 60 * 1000; // 整包导入要落盘几百个文件，给足时间
+/** 终态就这三个，其余都算还在跑 */
+const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * TT 酒馆专属的恢复路径：把 zip 整包交给内置的「数据迁移」扩展，让后端自己拆包落盘。
+ *
+ * 为什么分叉：原版 ST 根本没有"导入备份"这个接口，只能靠 restoreFromZip 按类写回
+ * （几百个请求、几百次判断）；而 TT 的 data-migration 后端本来就直接吃原版 ST 导出的 zip
+ * （manifest 里的 SILLYTAVERN_MIGRATION_COPY_KEY 写得很明白），一条请求搞定，
+ * 快得多，也不怕中途某个写入失败。
+ *
+ * 代价：进度在服务端，进程被杀就没了 —— 不像 restoreFromZip 能靠 localStorage 续传。
+ */
+async function restoreViaNativeImport(blob, fileName) {
+    notify('info', '正在把备份交给酒馆导入…');
+
+    const form = new FormData();
+    // 第三个参数是文件名，后端 materializeUploadFile 拿它当 preferredName
+    form.append('archive', blob, fileName || 'backup.zip');
+
+    const submitted = await stMustOk(
+        await stFetch(DM_API.import, { multipart: form }),
+        '提交导入任务',
+    );
+    const jobId = submitted.json && submitted.json.job_id;
+    if (!jobId) {
+        throw new Error(`酒馆没返回 job_id，导入没跑起来：${String(submitted.text || '').slice(0, 200)}`);
+    }
+
+    console.debug(LOG, '导入任务已提交：', jobId);
+    return waitForImportJob(jobId, fileName);
+}
+
+async function waitForImportJob(jobId, fileName) {
+    const deadline = Date.now() + JOB_TIMEOUT_MS;
+    let lastStage = '';
+
+    try {
+        for (;;) {
+            if (Date.now() > deadline) {
+                throw new Error(`导入等了 ${JOB_TIMEOUT_MS / 60000} 分钟还没结束，已放弃（酒馆那边可能还在跑）`);
+            }
+            await sleep(JOB_POLL_INTERVAL_MS);
+
+            // 这里刻意不用 stMustOk：job 状态体在失败时**本身就带 `error` 字段**，
+            // 而 stMustOk 一见 error 就当成"酒馆拒绝了这次请求"，会把失败原因吃掉。
+            const res = await stFetch(`${DM_API.job}?id=${encodeURIComponent(jobId)}`, { method: 'GET' });
+            const text = await res.text().catch(() => '');
+            if (!res.ok) {
+                throw new Error(`查询导入进度失败 HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`);
+            }
+            const json = text ? stParseJson(text, '导入进度') : {};
+            // 有的版本把状态包在 job/status 里，有的直接平铺，两种都认
+            const job = (json && json.state) ? json : ((json && (json.job || json.status)) || {});
+
+            if (job.stage && job.stage !== lastStage) {
+                lastStage = job.stage;
+                console.debug(LOG, `导入阶段：${job.stage}${job.message ? ` — ${job.message}` : ''}`);
+            }
+            const percent = Number(job.progress_percent);
+            STATE.restore = {
+                label: job.stage || '酒馆导入中',
+                done: Number.isFinite(percent) ? Math.round(percent) : 0,
+                total: 100,
+            };
+            renderStatus();
+
+            if (!TERMINAL_JOB_STATES.has(job.state)) continue;
+
+            if (job.state === 'completed') {
+                // 数据已经落盘了，但没对上账，得让下次同步重来一遍
+                const skipped = job.reconcile_error ? [`对账失败：${job.reconcile_error}`] : [];
+                return { native: true, written: 0, total: 0, alreadyDone: 0, skipped, fileName };
+            }
+            if (job.state === 'cancelled') throw new Error('导入被取消了');
+            throw new Error(`导入失败：${job.error || job.message || '酒馆没给出原因'}`);
+        }
+    } finally {
+        STATE.restore = null;
+    }
+}
+
 /* ---------------------------------------------------------------- 同步逻辑 */
 
 const latestKeyOf = (device) => `devices/${device}/latest.json`;
@@ -1235,10 +1440,13 @@ async function pullOne(device, latest) {
         throw new Error(`下载的备份大小对不上（期望 ${latest.size}，实际 ${blob.size}），可能传输中断，已放弃恢复`);
     }
 
-    const report = await restoreFromZip(blob, {
-        marker: markerOf(latest) || latest.fileName,
-        fileName: latest.fileName,
-    });
+    // TT 酒馆有原生整包导入，一条请求搞定；原版 ST 没有这个接口，只能拆开按类写回。
+    const report = isTauriTavern()
+        ? await restoreViaNativeImport(blob, latest.fileName)
+        : await restoreFromZip(blob, {
+            marker: markerOf(latest) || latest.fileName,
+            fileName: latest.fileName,
+        });
 
     // 有文件没写成，就先别记账。记了账等于"这份已经拿过了"，失败的那些再没机会重试；
     // 不记账的话下次同步会重拉一遍，把没写完的补上（写过的会按进度跳过）。
@@ -1251,10 +1459,12 @@ async function pullUpdates(updates) {
     // 恢复期间酒馆会甩出一堆事件，那些不是用户改动，先挂起检测
     STATE.suppressDirty = true;
     let files = 0;
+    let nativeCount = 0;
     const skipped = [];
     try {
         for (const item of updates) {
             const report = await pullOne(item.device, item.latest);
+            if (report.native) nativeCount += 1;
             files += report.written;
             skipped.push(...report.skipped);
         }
@@ -1264,13 +1474,18 @@ async function pullUpdates(updates) {
         setTimeout(() => { STATE.suppressDirty = false; }, 5000);
     }
 
+    // 原生整包导入是在服务端落盘的，前端拿不到"写了几个文件"，只能按份数报
+    const summary = nativeCount
+        ? `已整包导入 ${nativeCount} 份备份`
+        : `已还原 ${files} 个文件`;
+
     if (skipped.length) {
         notify('warn',
-            `已还原 ${files} 个文件，${skipped.length} 项没写成（下次同步会重试）：\n` +
+            `${summary}，${skipped.length} 项有问题（下次同步会重试）：\n` +
             skipped.slice(0, 5).join('\n') +
             (skipped.length > 5 ? `\n…还有 ${skipped.length - 5} 项，详见控制台` : ''));
     } else {
-        notify('success', `已还原 ${files} 个文件`);
+        notify('success', summary);
     }
     await offerReload();
 }
@@ -1465,9 +1680,8 @@ const PANEL_HTML = `
         两台酒馆各装一份本扩展，<b>本机标识必须不同</b>（一台 local，一台 cloud）。<br />
         <b>打开页面时</b>：自动判断云端最新备份是本机还是对面的，云端更新就拉，本机有改动就推。<br />
         <b>使用期间</b>：按上面设定的间隔自动上传（只传不拉，不会打断你聊天）。<br />
-        恢复是<b>合并式还原</b>：按类把对面的数据写回本机，同名覆盖，
-        <b>但不会删掉本机多出来的角色卡或聊天</b>。两边都改过时会先问你，不会闷头覆盖。<br />
-        角色画廊图、向量库、扩展私有文件这三类酒馆没有写入接口，还原不了（见 README）。
+        恢复方式：<span id="st_sync_restore_mode">（加载中…）</span>。<br />
+        两边都改过时会先问你，不会闷头覆盖。
       </div>
     </div>
   </div>
@@ -1526,6 +1740,7 @@ function buildUI() {
     $('#extensions_settings').append(PANEL_HTML);
     ui = {
         status: document.getElementById('st_sync_status'),
+        restoreMode: document.getElementById('st_sync_restore_mode'),
         confirmBox: $('#st_sync_confirm'),
         confirmText: $('#st_sync_confirm_text'),
         confirmOk: $('#st_sync_confirm_ok'),
@@ -1542,6 +1757,9 @@ function buildUI() {
     bindField('#st_sync_onload', 'checkOnLoad', { checkbox: true });
     bindField('#st_sync_conflict', 'conflictPolicy');
     bindField('#st_sync_keep', 'keepSnapshots', { number: true });
+
+    // 两条恢复路径的语义不一样，如实写出来，别让人以为哪台都是"只覆盖不删除"
+    if (ui.restoreMode) ui.restoreMode.textContent = restoreModeHint();
 
     $('#st_sync_btn_test').on('click', testConnection);
 
@@ -1587,8 +1805,8 @@ function buildUI() {
         }
 
         const go = await askUser(
-            `从中转拉取「${other}」的备份（${latest.fileName}），按类写回本机？\n` +
-            '同名文件会被覆盖；本机多出来的角色卡和聊天不会被删除。\n' +
+            `从中转拉取「${other}」的备份（${latest.fileName}）？\n` +
+            `${restoreModeHint()}。\n` +
             '结束后需要刷新页面。',
             '开始还原',
             '取消',

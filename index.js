@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-01.3';
+const EXT_VERSION = '2026-10-01.4';
 
 /**
  * 日志也往面板里记一份。
@@ -573,12 +573,37 @@ const TT_API = {
 
 /** TT 没有读接口的类，日志里点名跳过（接口名照抄源码，方便以后复核有没有补上） */
 const TT_NO_READ_API = [
-    ['/api/presets/*', '预设'],
-    ['/api/themes/*', '主题'],
-    ['/api/quick-replies/*', '快捷回复'],
-    ['movingUI', '界面布局'],
     ['/api/images/*', '图片'],
     ['/api/files/*', '聊天附件'],
+];
+
+/**
+ * 预设类数据虽然各有 save/delete 接口，却都没有 list —— 但**全都平铺在
+ * `/api/settings/get` 响应的兄弟字段上**（Rust 侧 `build_sillytavern_settings_response`
+ * 逐个目录读盘再塞进响应），所以不需要新接口。
+ *
+ * 两种形状：
+ *   - 对象数组：元素本身就是预设内容，名字在元素的 .name 里
+ *   - 「内容 + 名字」两个平行数组：元素是文件的原始 JSON 文本，名字在 *_names 里
+ *
+ * 左边是响应字段名，右边是要落的 zip 目录 —— 目录名和云侧 `PRESET_DIRECTORIES` /
+ * `classifyRestoreEntry` 完全一致，所以云侧一行都不用改。
+ */
+const TT_PRESET_FIELDS = [
+    ['themes', 'themes'],
+    ['movingUIPresets', 'movingUI'],
+    ['quickReplyPresets', 'QuickReplies'],
+    ['instruct', 'instruct'],
+    ['context', 'context'],
+    ['sysprompt', 'sysprompt'],
+    ['reasoning', 'reasoning'],
+];
+
+const TT_AI_PRESET_FIELDS = [
+    ['koboldai_settings', 'koboldai_setting_names', 'KoboldAI Settings'],
+    ['novelai_settings', 'novelai_setting_names', 'NovelAI Settings'],
+    ['openai_settings', 'openai_setting_names', 'OpenAI Settings'],
+    ['textgenerationwebui_presets', 'textgenerationwebui_preset_names', 'TextGen Settings'],
 ];
 
 /**
@@ -620,6 +645,128 @@ function ttSafePath(path) {
     return parts.every(Boolean) ? parts.join('/') : '';
 }
 
+/**
+ * 从 `/api/settings/get` 的响应里取出真正的 settings 本体。
+ *
+ * TT 回的**不是**裸 settings，而是一个套壳：settings 本体被序列化成**字符串**放在
+ * `.settings` 里，其余（world_names / themes / 各 AI 预设…）平铺成兄弟字段。
+ * 直接把整个套壳当 settings.json 写进包，云侧恢复出来 `power_user` 就不存在了 ——
+ * 用户人设的名字和描述（power_user.personas / persona_descriptions）会全空，
+ * 只剩头像列表还在（那是另一个类）。真机恢复时踩到过。
+ */
+function ttSettingsBody(wrapper) {
+    const raw = wrapper.settings;
+    if (typeof raw === 'string') {
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (err) {
+            throw new Error(`读设置：响应里的 settings 不是合法 JSON（${err.message}）`);
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('读设置：响应里的 settings 不是一个对象，读接口可能对不上');
+        }
+        return parsed;
+    }
+    // 万一哪天改成直接展开成对象，也认
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+    throw new Error('读设置：响应里没有 settings 字段，读接口可能对不上');
+}
+
+/**
+ * 预设文件的正文。
+ * 平行数组里的元素是**文件的原始 JSON 文本**，对象数组里的元素是已经解析好的对象。
+ * 文本要先验一下是不是合法 JSON：云侧 writePreset 会 stParseJson，塞进去一份坏文本
+ * 只会让那一类的恢复整个失败，不如这里就不要它。
+ */
+function ttPresetData(value) {
+    if (typeof value === 'string') {
+        const text = value.trim();
+        if (!text) return null;
+        try {
+            JSON.parse(text);
+        } catch {
+            return null;
+        }
+        return text;
+    }
+    if (value && typeof value === 'object') return JSON.stringify(value, null, 2);
+    return null;
+}
+
+/** 预设的名字：对象看 .name，原始文本得先解开再看 .name */
+function ttPresetName(value) {
+    if (typeof value === 'string') {
+        try {
+            const parsed = JSON.parse(value);
+            return parsed && typeof parsed.name === 'string' ? parsed.name : '';
+        } catch {
+            return '';
+        }
+    }
+    if (value && typeof value === 'object' && typeof value.name === 'string') return value.name;
+    return '';
+}
+
+/**
+ * 把预设类写成 zip 条目。
+ *
+ * 目录名必须和云侧 `PRESET_DIRECTORIES` / `classifyRestoreEntry` 对得上，
+ * 否则云侧认不出来，这一类就等于没备份。
+ */
+function collectTtPresets(wrapper, entries, skipped) {
+    let ok = 0;
+    let total = 0;
+
+    const push = (dir, rawName, data) => {
+        const safe = ttSafeName(rawName);
+        if (!safe) {
+            skipped.push(`${dir}：“${rawName}”名字里有路径分隔符，跳过`);
+            return;
+        }
+        const name = `${dir}/${safe}.json`;
+        // 同名预设只留第一条（真机上重名不该出现，但静默覆盖会让人以为备份全了）
+        if (entries.some((entry) => entry.name === name)) {
+            skipped.push(`${dir}：${safe} 重名，只留第一条`);
+            return;
+        }
+        entries.push({ name, data });
+        ok += 1;
+    };
+
+    for (const [field, dir] of TT_PRESET_FIELDS) {
+        const list = Array.isArray(wrapper[field]) ? wrapper[field] : [];
+        total += list.length;
+        for (const item of list) {
+            const data = ttPresetData(item);
+            const name = ttPresetName(item);
+            if (!data || !name) {
+                skipped.push(`${dir}：有一条读不出内容或名字，跳过`);
+                continue;
+            }
+            push(dir, name, data);
+        }
+    }
+
+    for (const [field, namesField, dir] of TT_AI_PRESET_FIELDS) {
+        const list = Array.isArray(wrapper[field]) ? wrapper[field] : [];
+        const names = Array.isArray(wrapper[namesField]) ? wrapper[namesField] : [];
+        total += list.length;
+        for (let i = 0; i < list.length; i += 1) {
+            const data = ttPresetData(list[i]);
+            // 名字优先用平行数组里的（那是落盘文件名，最准），再退回内容里的 .name
+            const name = ttSafeName(names[i]) || ttPresetName(list[i]);
+            if (!data || !name) {
+                skipped.push(`${dir}：有一条读不出内容或名字，跳过`);
+                continue;
+            }
+            push(dir, name, data);
+        }
+    }
+
+    if (total) log(`逐类读：预设/主题 ${ok}/${total} 条`);
+}
+
 /** 消息数组 → jsonl。云侧 stParseJsonl 是一行一条读回来的，格式必须对得上 */
 function jsonlOf(messages, what) {
     if (!Array.isArray(messages)) throw new Error(`${what}：酒馆回的不是消息数组`);
@@ -644,13 +791,14 @@ async function collectTtEntries() {
         renderStatus();
     };
 
-    // ---- 设置：整份最后的条目，但得先读，因为世界书名单只在它里面 ----
+    // ---- 设置：整份最后的条目，但得先读，因为它里面还挂着世界书名单和各类预设 ----
     step('读设置');
-    const settings = await ttReadJson(TT_API.settingsGet, {}, '读设置');
-    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    const wrapper = await ttReadJson(TT_API.settingsGet, {}, '读设置');
+    if (!wrapper || typeof wrapper !== 'object' || Array.isArray(wrapper)) {
         throw new Error('读设置：酒馆回的不是一个对象，读接口可能对不上');
     }
-    const worldNames = Array.isArray(settings.world_names) ? settings.world_names.filter(Boolean) : [];
+    const settings = ttSettingsBody(wrapper);
+    const worldNames = Array.isArray(wrapper.world_names) ? wrapper.world_names.filter(Boolean) : [];
     log(`逐类读：设置 1 份，里面记着 ${worldNames.length} 本世界书`);
 
     // ---- 角色卡 + 每个角色的聊天 ----
@@ -754,6 +902,9 @@ async function collectTtEntries() {
     }
     log(`逐类读：世界书 ${worldOk}/${worldNames.length} 本`);
 
+    // ---- 预设 / 主题 / 快捷回复 / 界面布局 / 各 AI 预设：平铺在设置响应的兄弟字段上 ----
+    collectTtPresets(wrapper, entries, skipped);
+
     // ---- 背景图 / 用户头像：TT 只给"名字列表"，字节得自己按前端那套相对路径去取 ----
     await collectTtImages(entries, skipped);
 
@@ -766,6 +917,38 @@ async function collectTtEntries() {
     }
 
     return { entries, skipped };
+}
+
+/**
+ * `/api/backgrounds/all` 的 images[] 元素**是个对象** `{filename, isAnimated}`，
+ * 不是字符串（TT 前端自己也有这层兼容，backgrounds.js:119）。
+ * 早先这里 `String(raw)` 会拼成 `backgrounds/[object Object]`，28 张背景一张都取不到。
+ */
+function ttBackgroundName(entry) {
+    if (typeof entry === 'string') return entry;
+    if (entry && typeof entry === 'object' && typeof entry.filename === 'string') return entry.filename;
+    return '';
+}
+
+/** 用户头像列表真机上是字符串数组；对象形状也认一手，别再赌形状 */
+function ttAvatarName(entry) {
+    if (typeof entry === 'string') return entry;
+    if (entry && typeof entry === 'object') {
+        for (const key of ['filename', 'name', 'avatar']) {
+            if (typeof entry[key] === 'string') return entry[key];
+        }
+    }
+    return '';
+}
+
+/**
+ * 图片的相对 URL。TT 前端的 `getBackgroundPath()` 走的是 `encodeURIComponent`，
+ * 头像那条路（`User Avatars/<名字>`）在真机上也是编码过的 —— 服务端会解开。
+ * 但背景图可能在子目录里，整段编码会把 '/' 也编掉，所以**逐段**编码：既转义空格和
+ * 中文，又保住路径分隔符。
+ */
+function ttImageUrl(dir, rel) {
+    return `${dir}/${String(rel).split('/').map(encodeURIComponent).join('/')}`;
 }
 
 /**
@@ -797,12 +980,13 @@ async function collectTtImages(entries, skipped) {
         const images = (list && Array.isArray(list.images)) ? list.images : [];
         bgTotal = images.length;
         for (const raw of images) {
-            const rel = String(raw || '');
+            const rel = ttBackgroundName(raw);
+            if (!rel) continue;
             // 自定义 URL（http 开头）本来就不在备份里，是用户外链
-            if (!rel || /^[a-z][a-z0-9+.-]*:/i.test(rel)) continue;
+            if (/^[a-z][a-z0-9+.-]*:/i.test(rel)) continue;
             const safe = ttSafePath(rel);
             if (!safe) continue;
-            const bytes = await fetchImage(`backgrounds/${encodeURI(rel)}`, `取背景图 ${rel}`);
+            const bytes = await fetchImage(ttImageUrl('backgrounds', rel), `取背景图 ${rel}`);
             if (!bytes) continue;
             entries.push({ name: `backgrounds/${safe}`, data: bytes });
             bgOk += 1;
@@ -812,18 +996,19 @@ async function collectTtImages(entries, skipped) {
         skipped.push(`背景图：${err.message}`);
     }
     if (bgTotal && bgOk < bgTotal) {
-        skipped.push(`背景图：${bgTotal} 张里只取到 ${bgOk} 张（TT 没有按路径读字节的接口）`);
+        skipped.push(`背景图：${bgTotal} 张里只取到 ${bgOk} 张`);
     }
 
     let avatarOk = 0;
     let avatarTotal = 0;
     try {
-        const names = await ttReadJson(TT_API.avatarsGet, {}, '列用户头像');
-        avatarTotal = (Array.isArray(names) ? names : []).length;
-        for (const raw of Array.isArray(names) ? names : []) {
+        const list = await ttReadJson(TT_API.avatarsGet, {}, '列用户头像');
+        const names = (Array.isArray(list) ? list : []).map((item) => ttAvatarName(item)).filter(Boolean);
+        avatarTotal = names.length;
+        for (const raw of names) {
             const safe = ttSafeName(raw);
             if (!safe) continue;
-            const bytes = await fetchImage(`User Avatars/${encodeURIComponent(safe)}`, `取用户头像 ${safe}`);
+            const bytes = await fetchImage(ttImageUrl('User Avatars', raw), `取用户头像 ${safe}`);
             if (!bytes) continue;
             entries.push({ name: `User Avatars/${safe}`, data: bytes });
             avatarOk += 1;
@@ -833,7 +1018,7 @@ async function collectTtImages(entries, skipped) {
         skipped.push(`用户头像：${err.message}`);
     }
     if (avatarTotal && avatarOk < avatarTotal) {
-        skipped.push(`用户头像：${avatarTotal} 张里只取到 ${avatarOk} 张（TT 没有按路径读字节的接口）`);
+        skipped.push(`用户头像：${avatarTotal} 张里只取到 ${avatarOk} 张`);
     }
 }
 

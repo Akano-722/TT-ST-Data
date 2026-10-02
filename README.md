@@ -42,7 +42,7 @@ SillyTavern 的备份/恢复接口在不同版本间改过，猜错会表现为"
 | 跑在哪 | 怎么恢复 | 为什么 |
 |---|---|---|
 | 原版 ST（云酒馆） | 把 zip 拆开，**按类写回**，每类数据调酒馆前端自己也在用的保存接口 | 没有别的路 |
-| TT 酒馆 | `POST /api/extensions/data-migration/import` **整包导入**，后端自己拆包落盘 | TT 内置的「数据迁移」扩展直接吃原版 ST 导出的 zip，一条请求搞定 |
+| TT 酒馆 | `POST /api/extensions/data-migration/import` **整包导入**，后端自己拆包落盘 | TT 内置的「数据迁移」扩展直接吃原版 ST 导出的 zip，一条请求搞定。**手机上要多绕一步**：TT 在移动端故意只让走原生文件选择器，扩展会先把包暂存进 App 缓存再按路径提交（见 [`tools/tt-tavern-api.md`](tools/tt-tavern-api.md) 第 2 节） |
 
 分叉的依据、以及每条路由的原始出处，都写在 [`tools/tt-tavern-api.md`](tools/tt-tavern-api.md) 里。
 换酒馆版本后如果哪边失效，用 `tools/probe-st-backup.md` 重新探测，改 `extension/st-sync/index.js`
@@ -266,6 +266,9 @@ git push origin extension
 
 - 同步是整份覆盖，不做文件级合并。
 - 恢复后需要刷新页面，酒馆内存里还是旧数据。
+- **手机上（TT）从中转恢复时，包会先原样暂存一份到 App 缓存**（TT 在移动端只认原生文件选择器，
+  绕行方案见 [`tools/tt-tavern-api.md`](tools/tt-tavern-api.md) 第 2 节），
+  所以那一刻磁盘上会多占一个和备份同样大的文件，导入跑完扩展会自己删掉。
 - 传输未加密（依赖 HTTPS）。中转服务本身不做端到端加密。
 - 自动上传靠浏览器定时器，只在**页面开着**时才跑。
 - 原版 ST 那条恢复路是**合并式**的：同名覆盖，**不会删掉本机多出来的角色卡和聊天**；

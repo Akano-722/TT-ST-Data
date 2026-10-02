@@ -71,11 +71,13 @@ const EXPORTS = [
  * 把真实扩展加载进一个假的浏览器环境。
  *
  * @param {object}   o
- * @param {Function} o.fetchImpl   替代 fetch（按 url 分发）
- * @param {boolean}  o.tav         要不要装成 TT 酒馆（挂不挂 window.__TAURITAVERN__）
- * @param {object}   o.seed        localStorage 里的初始值
+ * @param {Function} o.fetchImpl     替代 fetch（按 url 分发）
+ * @param {boolean}  o.tav           要不要装成 TT 酒馆（挂不挂 window.__TAURITAVERN__）
+ * @param {object}   o.seed          localStorage 里的初始值
+ * @param {Function} o.tauriInvoke   装上 window.__TAURI__.core.invoke（TT 的 IPC 通道）
+ * @param {string}   o.userAgent     伪装 navigator.userAgent（区分 iOS / Android 分支）
  */
-function loadExtension({ fetchImpl, tav = false, seed = {} } = {}) {
+function loadExtension({ fetchImpl, tav = false, seed = {}, tauriInvoke = null, userAgent = '' } = {}) {
     const src = fs.readFileSync(INDEX_JS, 'utf8');
     const store = new Map(Object.entries(seed).map(([k, v]) => [k, String(v)]));
 
@@ -89,6 +91,12 @@ function loadExtension({ fetchImpl, tav = false, seed = {} } = {}) {
         },
     };
     if (tav) win.__TAURITAVERN__ = { version: 'test' };
+    if (tauriInvoke) win.__TAURI__ = { core: { invoke: tauriInvoke } };
+
+    // 扩展里读的是裸的 navigator.userAgent（判 Android 用）。Node 也有全局 navigator，
+    // 不显式塞一个进来就会拿到 "Node.js/xx"，测试里分不出 iOS / Android 两支。
+    const nav = { userAgent, clipboard: undefined };
+    win.navigator = nav;
 
     const calls = [];
     const routing = (url, opts) => {
@@ -99,7 +107,7 @@ function loadExtension({ fetchImpl, tav = false, seed = {} } = {}) {
     // document 只在 buildUI 里用，测试不建界面；jQuery 是个空壳，文件末尾那句
     // jQuery(async () => init()) 因此不会真的跑起来。
     const factory = new Function(
-        'window', 'document', 'jQuery', 'fetch', 'location',
+        'window', 'document', 'jQuery', 'fetch', 'location', 'navigator',
         `${src}\nreturn { ${EXPORTS.join(', ')} };`,
     );
     const api = factory(
@@ -108,6 +116,7 @@ function loadExtension({ fetchImpl, tav = false, seed = {} } = {}) {
         () => {},
         routing,
         { reload() {} },
+        nav,
     );
     return { api, win, calls, store };
 }
@@ -490,21 +499,38 @@ async function testTimeoutWiring(bad_) {
  * 造一套假的"TT 酒馆"：给什么发什么。
  * 返回的 fetch 会记录每一次请求，用来断言"走的是哪条路"。
  */
-function makeTavFetch({ jobStates, onImport }) {
+function makeTavFetch({ jobStates, onImport, rejectMultipart = false }) {
     const zipBlobContent = 'PK-not-really-a-zip';  // 故意不是 zip：走 zip 路径必炸
-    const seen = { imported: false, pollCount: 0, archiveName: '', archiveType: '' };
+    const seen = {
+        imported: false, pollCount: 0, archiveName: '', archiveType: '',
+        uploadAttempts: 0, archivePath: '', importContentType: '',
+    };
 
     const impl = async (url, opts) => {
         if (url.includes('/api/users/backup')) {
             throw new Error('TT 分支不该再去下载备份');
         }
         if (url.includes('/api/extensions/data-migration/import')) {
-            seen.imported = true;
             const form = opts.body;
-            const file = form && typeof form.get === 'function' ? form.get('archive') : null;
-            if (!file) throw new Error('FormData 里没有 archive 字段');
-            seen.archiveName = file.name || '';
-            seen.archiveType = file.type || '';
+            if (form && typeof form.get === 'function') {
+                seen.uploadAttempts += 1;
+                if (rejectMultipart) {
+                    // 移动端酒馆的原话（upload-service.js 的 nativeArchivePickerError）
+                    return json({
+                        error: 'Unable to access uploaded archive: '
+                            + 'iOS data archive imports must use the native archive picker',
+                    }, 400);
+                }
+                seen.imported = true;
+                const file = form.get('archive');
+                if (!file) throw new Error('FormData 里没有 archive 字段');
+                seen.archiveName = file.name || '';
+                seen.archiveType = file.type || '';
+            } else {
+                seen.imported = true;
+                seen.archivePath = JSON.parse(opts.body).archive_path;
+                seen.importContentType = (opts.headers && (opts.headers['Content-Type'] || opts.headers['content-type'])) || '';
+            }
             if (onImport) await onImport();
             return json({ ok: true, job_id: 'job-1' });
         }
@@ -756,6 +782,126 @@ async function testImportSubmitFailure(bad_) {
     else if (!err.message.includes('不认识的归档格式')) bad('没把酒馆给的原因带出来', err.message);
     else ok('把酒馆给的原因带出来了', err.message);
     if (api.STATE.restore !== null) bad('提交失败后 STATE.restore 没清空', '状态栏会卡住');
+}
+
+/**
+ * 移动端：酒馆不给网页直接交包，得自己暂存成文件再走 archive_path。
+ *
+ * 钉的是 2026-10-02 真机那次 400：
+ *   {"error":"Unable to access uploaded archive: iOS data archive imports must use the native archive picker"}
+ * —— TT 在 iOS/Android 上**故意**封死了 FormData 交备份包这条路（源码依据见 index.js 的 ttStageArchive）。
+ * 绕行的每一步都得钉住，尤其是「字节有没有原样落进去」：暂存错了包，
+ * 导入照样会报成功，坏的是数据，而且要到很久以后才发现。
+ */
+async function testTtMobileImportBypass(bad_) {
+    console.log('\n── 移动端：FormData 被拒 → 暂存绕行 ──');
+
+    const archive = Buffer.from('PK-staged-archive-bytes-0123456789'.repeat(200));
+    const CHUNK = 1024;              // 故意比包小，好验证确实是分片写的
+    const staged = { chunks: [], discarded: 0 };
+
+    const tauriInvoke = async (command, args, options) => {
+        if (command === 'stage_upload_begin') {
+            staged.beginKind = args.dto.kind;
+            staged.beginSize = args.dto.size;
+            staged.beginExtension = args.dto.preferred_extension;
+            staged.path = '/fake-staging/generic/abc.zip';
+            return { file_path: staged.path, chunk_size: CHUNK };
+        }
+        if (command === 'stage_upload_chunk') {
+            const headers = (options && options.headers) || {};
+            staged.chunks.push({
+                offset: Number(headers.offset),
+                bytes: args instanceof Uint8Array ? Buffer.from(args) : null,
+                payload: args,
+            });
+            return Number(headers.offset) + (args instanceof Uint8Array ? args.length : 0);
+        }
+        if (command === 'stage_upload_finish') {
+            staged.finished = { path: args.file_path, size: args.expected_size };
+            return { file_path: args.file_path, size: args.expected_size };
+        }
+        if (command === 'stage_upload_discard') {
+            staged.discarded += 1;
+            return null;
+        }
+        throw new Error(`没料到的 IPC：${command}`);
+    };
+
+    const { impl, seen } = makeTavFetch({
+        rejectMultipart: true,
+        jobStates: [{ state: 'completed', local_applied: true }],
+    });
+    const { api } = loadExtension({
+        fetchImpl: impl,
+        tav: true,
+        tauriInvoke,
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        seed: configSeed('http://relay.test'),
+    });
+
+    const report = await api.restoreViaNativeImport(new Blob([archive]), 'backup.zip');
+
+    if (seen.uploadAttempts !== 1) bad('没先试 FormData 那条正路', `试了 ${seen.uploadAttempts} 次`);
+    else ok('先走正路（FormData），被拒了才绕行');
+
+    if (!staged.beginKind) bad('压根没调 stage_upload_begin', '绕行没生效');
+    else if (staged.beginKind === 'data-archive') {
+        bad('暂存用了 data-archive 这个 kind', '那正是酒馆在移动端点名拦掉的名字，必然失败');
+    } else ok(`暂存用的 kind 是 ${staged.beginKind}（不是被拦的 data-archive）`);
+
+    if (staged.beginExtension !== 'zip') bad('暂存没带上扩展名 zip', String(staged.beginExtension));
+    if (staged.beginSize !== archive.length) bad('暂存没报对包大小', `${staged.beginSize} != ${archive.length}`);
+
+    if (staged.chunks.some((c) => !c.bytes)) bad('iOS 上没走裸二进制分片', 'iOS 该传 Uint8Array，base64 是 Android 那条');
+    else {
+        const rebuilt = Buffer.concat(staged.chunks.map((c) => c.bytes));
+        const offsetsOk = staged.chunks.every((c, i) => c.offset === i * CHUNK);
+        if (!offsetsOk) bad('分片 offset 不连续', staged.chunks.map((c) => c.offset).join(','));
+        else if (!rebuilt.equals(archive)) bad('暂存回去的字节和原包不一样', `${rebuilt.length} vs ${archive.length}`);
+        else ok(`分 ${staged.chunks.length} 片暂存，offset 连续、拼回来逐字节相同`);
+    }
+    if (!staged.finished || staged.finished.size !== archive.length) {
+        bad('stage_upload_finish 没报对大小', JSON.stringify(staged.finished));
+    } else ok('stage_upload_finish 带了正确的 expected_size');
+
+    if (seen.archivePath !== staged.path) {
+        bad('提交的 archive_path 不是暂存那个路径', `${seen.archivePath} != ${staged.path}`);
+    } else ok('拿暂存路径走 JSON 分支提交（酒馆那条分支没有平台判断）');
+
+    if (!/application\/json/i.test(seen.importContentType)) {
+        bad('JSON 那条没带 Content-Type', seen.importContentType || '(空)');
+    } else ok('JSON 提交带了 Content-Type: application/json（和酒馆自己的前端一致）');
+
+    if (!report.native) bad('绕行成功后没标 native', JSON.stringify(report));
+    if (staged.discarded !== 1) {
+        bad('导入结束后没清理暂存文件', `discard 调了 ${staged.discarded} 次`);
+    } else ok('导入结束后把暂存文件删了（这条路上酒馆不会替我们删）');
+    if (api.STATE.download !== null) bad('导入期间没撤掉暂存进度条', JSON.stringify(api.STATE.download));
+}
+
+/** 正路被拒、绕行也走不通时，不能只甩一个英文 400 —— 得给人一条手动导入的路 */
+async function testTtMobileImportBypassUnavailable(bad_) {
+    console.log('\n── 移动端：绕行也用不了时要给人话 ──');
+
+    const { impl } = makeTavFetch({ rejectMultipart: true, jobStates: [{ state: 'completed' }] });
+    // 刻意不挂 __TAURI__：模拟"酒馆版本变了，这条内部通道没了"
+    const { api } = loadExtension({ fetchImpl: impl, tav: true, seed: configSeed('http://relay.test') });
+
+    let err = null;
+    try {
+        await api.restoreViaNativeImport(new Blob(['PK-x']), 'backup.zip');
+    } catch (e) {
+        err = e;
+    }
+
+    if (!err) bad('两条路都断了却没报错', '会被当成导入成功');
+    else if (!err.message.includes('数据迁移') || !err.message.includes('文件')) {
+        bad('没给出人工导入的指引', err.message);
+    } else ok('报错里带了人工导入的指引，不是干巴巴一个 400', err.message.slice(0, 60) + '…');
+
+    if (api.STATE.download !== null) bad('绕行失败后进度条没撤', JSON.stringify(api.STATE.download));
+    if (api.STATE.restore !== null) bad('绕行失败后还原进度没撤', JSON.stringify(api.STATE.restore));
 }
 
 /** 没挂 __TAURITAVERN__ 就是原版 ST —— 判定本身别写反 */
@@ -1797,6 +1943,8 @@ async function main() {
     await testClassicBranch(bad);
     await testJobOutcomes(bad);
     await testImportSubmitFailure(bad);
+    await testTtMobileImportBypass(bad);
+    await testTtMobileImportBypassUnavailable(bad);
     await testDiagnostics(bad);
     await testZipWriter(bad);
     await testTtBackupBuild(bad);

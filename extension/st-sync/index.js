@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.7';
+const EXT_VERSION = '2026-10-02.8';
 
 /**
  * 日志也往面板里记一份。
@@ -578,7 +578,8 @@ function renderStatus() {
         const amount = d.total
             ? `${fmtBytes(d.done)} / ${fmtBytes(d.total)}（${Math.floor((d.done / d.total) * 100)}%）`
             : fmtBytes(d.done);
-        parts.push(`⏳ 正在下载 ${d.label}…　${amount}　已 ${secs} 秒`);
+        // verb 默认"下载"：这个进度条先是给下载用的，暂存那条路复用同一套显示
+        parts.push(`⏳ 正在${d.verb || '下载'} ${d.label}…　${amount}　已 ${secs} 秒`);
     } else if (STATE.busy) {
         const secs = STATE.busySince ? Math.floor((Date.now() - STATE.busySince) / 1000) : 0;
         parts.push(`⏳ ${STATE.step ? `${STATE.step}…` : '正在同步…'}　已 ${secs} 秒`);
@@ -2012,8 +2013,8 @@ function buildZip(entries, { date } = {}) {
  * 酒馆接口的通用调用。multipart 时不能带 Content-Type，否则浏览器补不上 boundary。
  * method 只有 data-migration 的 job 查询要用 GET，其余全是 POST。
  */
-async function stFetch(url, { json, multipart, method = 'POST' } = {}) {
-    const headers = { ...ctx().getRequestHeaders() };
+async function stFetch(url, { json, multipart, method = 'POST', headers: extraHeaders } = {}) {
+    const headers = { ...ctx().getRequestHeaders(), ...(extraHeaders || {}) };
     let body;
     if (multipart) {
         delete headers['Content-Type'];
@@ -2418,6 +2419,192 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/* ------------------------------------------------- TT 原生导入：移动端的绕行 */
+
+/** 暂存目录的 kind。**千万不能**叫 data-archive —— 那个名字在移动端被酒馆点名拦掉（见下） */
+const TT_STAGE_KIND = 'st-sync-restore';
+/** 酒馆没回 chunk_size 时的兜底片大小；正常它会给（移动端 1 MB） */
+const TT_STAGE_CHUNK_FALLBACK = 1024 * 1024;
+/** 单次 IPC 的上限。本机写盘，正常亚秒级，60 秒还不回就是真出事了 */
+const TT_STAGE_IPC_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * 酒馆用"移动端只认原生文件选择器"为由拒绝时抛的那句话。
+ * 出处：TT 源码 `src/tauri/main/services/uploads/upload-service.js` 的 nativeArchivePickerError。
+ */
+function isNativePickerOnlyError(err) {
+    return /native archive picker/i.test(String((err && err.message) || err || ''));
+}
+
+function ttTauriInvoke() {
+    const core = window.__TAURI__ && window.__TAURI__.core;
+    if (!core || typeof core.invoke !== 'function') {
+        throw new Error('拿不到 Tauri 的 invoke（酒馆版本可能变了）');
+    }
+    return core.invoke;
+}
+
+function isAndroidWebView() {
+    return /android/i.test((navigator && navigator.userAgent) || '');
+}
+
+/**
+ * Tauri 的 invoke 没有超时机制，卡住就是永远卡住 —— STATE.busy 不落，界面看着就是死了。
+ *
+ * 和 fetch 那边不同：fetch 超时放弃之后连接还挂在后台，所以那边要真 abort；
+ * 这里放弃之后我们**立刻把整个暂存流程作废**（删掉半截文件），不会有东西留在那儿，
+ * 所以用 Promise.race 这种"我不等了"就够了。
+ */
+function ipcWithTimeout(promise, what) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`${what} 超时：${TT_STAGE_IPC_TIMEOUT_MS / 1000} 秒没有回应`));
+        }, TT_STAGE_IPC_TIMEOUT_MS);
+        promise.then(
+            (value) => { clearTimeout(timer); resolve(value); },
+            (err) => { clearTimeout(timer); reject(err); },
+        );
+    });
+}
+
+/**
+ * 把内存里的 zip 暂存进酒馆的 App 缓存，换回一个**酒馆自己读得到**的路径。
+ *
+ * 为什么非要有这一步（2026-10-02 真机坐实）：
+ * 移动端上 `POST /api/extensions/data-migration/import` 只认 FormData，
+ * 而酒馆一见 kind 是 data-archive 就直接拒，回一句
+ * "iOS data archive imports must use the native archive picker" ——
+ * 也就是说它只让走原生文件选择器，可我们的包是内存里的 Blob，到不了「文件」App。
+ *
+ * 绕行的依据（都对着 TT 源码核过，不是猜的）：
+ *  1. 那道闸**只认 kind == 'data-archive'**：JS 侧在 upload-service.js 的
+ *     materializeUploadFile 里，Rust 侧在 stage_upload_begin 的
+ *     ensure_mobile_archive_uses_native_picker 里，两处都是先比 kind 再拒。换个 kind 就放行。
+ *  2. `stage_upload_begin/chunk/finish` 是**酒馆自己的命令**，内部用 tokio::fs 直接落盘，
+ *     不经过 tauri-plugin-fs，也就没有 scope 检查 —— 上传侧那次踩的 `forbidden path`
+ *     正是 fs 插件的 scope 问题（见 tools/tt-tavern-api.md 第 3 节），这条路结构上没有它。
+ *  3. 酒馆自己在 iOS 上导角色卡走的就是这三个命令
+ *     （character-import-route.js → materializeUploadFile(kind:'character-import')，
+ *      那个 kind 没有平台限制）。这是它的主力上传通道，不是冷门分支。
+ *  4. 拿到路径后走导入接口的 JSON 分支（`{ archive_path }`），那条分支**没有平台判断**，
+ *     和桌面端"选了文件"是同一条代码。
+ *
+ * 失效的那天：酒馆把闸也加到 JSON 分支上。那时这里会抛错，日志里能看到"暂存"开头的失败，
+ * 不会被当成成功。
+ */
+async function ttStageArchive(blob, fileName, onProgress) {
+    const invoke = ttTauriInvoke();
+    const android = isAndroidWebView();
+    const extension = (/\.([a-z0-9]{1,12})$/i.exec(String(fileName || '')) || [])[1] || 'zip';
+
+    const begun = await ipcWithTimeout(invoke('stage_upload_begin', {
+        dto: {
+            kind: TT_STAGE_KIND,
+            preferred_extension: extension.toLowerCase(),
+            size: blob.size,
+        },
+    }), '酒馆暂存（开始）');
+
+    const filePath = String((begun && begun.file_path) || '').trim();
+    if (!filePath) throw new Error('酒馆没返回暂存路径');
+
+    let chunkSize = Math.floor(Number(begun && begun.chunk_size) || 0);
+    if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) chunkSize = TT_STAGE_CHUNK_FALLBACK;
+    log(`暂存到酒馆：每片 ${fmtBytes(chunkSize)}，共 ${fmtBytes(blob.size)}`);
+
+    const discard = async () => {
+        try {
+            await ipcWithTimeout(invoke('stage_upload_discard', { file_path: filePath }), '酒馆暂存（清理）');
+            log('暂存文件已清理');
+        } catch (err) {
+            // 删不掉不影响这次导入（包已经落盘了），只是 App 缓存里多留一份
+            log('暂存文件没删掉（不影响这次导入）', err);
+        }
+    };
+
+    try {
+        let offset = 0;
+        while (offset < blob.size) {
+            const end = Math.min(offset + chunkSize, blob.size);
+            const bytes = new Uint8Array(await blob.slice(offset, end).arrayBuffer());
+            const headers = { 'file-path': encodeURIComponent(filePath), offset: String(offset) };
+            let payload;
+            if (android) {
+                // Android 那边 Tauri 收不下裸二进制，酒馆自己也是这么绕的（upload-service.js）
+                headers['chunk-encoding'] = 'base64';
+                payload = { data: base64FromBytes(bytes) };
+            } else {
+                payload = bytes;
+            }
+
+            const next = Number(await ipcWithTimeout(
+                invoke('stage_upload_chunk', payload, { headers }),
+                '酒馆暂存（写入）',
+            ));
+            if (next !== end) throw new Error(`暂存偏移不对（写到 ${offset}，酒馆回了 ${next}，期望 ${end}）`);
+
+            offset = end;
+            if (onProgress) onProgress(offset, blob.size);
+        }
+
+        await ipcWithTimeout(invoke('stage_upload_finish', {
+            file_path: filePath,
+            expected_size: blob.size,
+        }), '酒馆暂存（收尾）');
+
+        return { filePath, discard };
+    } catch (err) {
+        // 半截文件别留着，它永远也不会被导入
+        await discard();
+        throw err;
+    }
+}
+
+/** 酒馆回的是 `{ ok, job_id }`，没有 job_id 就当没跑起来 */
+function importJobIdOf(submitted, what) {
+    const jobId = submitted.json && submitted.json.job_id;
+    if (!jobId) {
+        const detail = submitted.text ? `（${String(submitted.text).slice(0, 200)}）` : '';
+        throw new Error(`${what}：酒馆没返回 job_id，导入没跑起来${detail}`);
+    }
+    log(`${what}已提交：`, jobId);
+    return jobId;
+}
+
+/** 正路：把 Blob 用 FormData 交上去。桌面端、以及酒馆将来放开移动端时走的都是这条 */
+async function submitImportByUpload(blob, fileName) {
+    const form = new FormData();
+    // 第三个参数是文件名，后端 materializeUploadFile 拿它当 preferredName
+    form.append('archive', blob, fileName || 'backup.zip');
+    const submitted = await stMustOk(await stFetch(DM_API.import, { multipart: form }), '提交导入任务');
+    return importJobIdOf(submitted, '提交导入任务');
+}
+
+/** 绕行：先自己把包暂存成文件，再把路径交上去（见 ttStageArchive） */
+async function submitImportByPath(blob, fileName) {
+    const staged = await ttStageArchive(blob, fileName, (done, total) => {
+        STATE.download = { label: fileName || 'backup.zip', done, total, verb: '暂存到酒馆' };
+        renderStatus();
+    });
+    STATE.download = null;
+
+    try {
+        const submitted = await stMustOk(
+            await stFetch(DM_API.import, {
+                json: { archive_path: staged.filePath },
+                // 酒馆自己的前端也显式带这个头（data-migration/index.js 的 startImportJobFromDesktopPicker），
+                // 别指望 getRequestHeaders 里一定已经有
+                headers: { 'Content-Type': 'application/json' },
+            }),
+            '提交导入任务（按路径）',
+        );
+        return { jobId: importJobIdOf(submitted, '提交导入任务（按路径）'), cleanup: staged.discard };
+    } catch (err) {
+        await staged.discard();
+        throw err;
+    }
+}
+
 /**
  * TT 酒馆专属的恢复路径：把 zip 整包交给内置的「数据迁移」扩展，让后端自己拆包落盘。
  *
@@ -2426,26 +2613,46 @@ function sleep(ms) {
  * （manifest 里的 SILLYTAVERN_MIGRATION_COPY_KEY 写得很明白），一条请求搞定，
  * 快得多，也不怕中途某个写入失败。
  *
+ * 移动端要多绕一步：先照常 FormData，酒馆以"只认原生选择器"为由拒了才改走暂存
+ * （见 ttStageArchive）。**顺序不能反** —— 桌面端、以及酒馆以后放开的版本都该走那条正路，
+ * 而且一旦绕行，包会先在 App 缓存里多落一份。
+ *
  * 代价：进度在服务端，进程被杀就没了 —— 不像 restoreFromZip 能靠 localStorage 续传。
  */
 async function restoreViaNativeImport(blob, fileName) {
     notify('info', '正在把备份交给酒馆导入…');
 
-    const form = new FormData();
-    // 第三个参数是文件名，后端 materializeUploadFile 拿它当 preferredName
-    form.append('archive', blob, fileName || 'backup.zip');
+    let jobId;
+    let cleanup = async () => {};
+    try {
+        jobId = await submitImportByUpload(blob, fileName);
+    } catch (err) {
+        if (!isNativePickerOnlyError(err)) throw err;
 
-    const submitted = await stMustOk(
-        await stFetch(DM_API.import, { multipart: form }),
-        '提交导入任务',
-    );
-    const jobId = submitted.json && submitted.json.job_id;
-    if (!jobId) {
-        throw new Error(`酒馆没返回 job_id，导入没跑起来：${String(submitted.text || '').slice(0, 200)}`);
+        log('酒馆不接受网页直接交包（移动端只认原生文件选择器），改走暂存绕行');
+        notify('info', '酒馆要原生选择器，改走暂存绕行…');
+        let staged;
+        try {
+            staged = await submitImportByPath(blob, fileName);
+        } catch (inner) {
+            // 正路和绕行都没走通：把话说明白，别让人对着一个英文 400 猜
+            throw new Error(
+                `${(inner && inner.message) || inner}｜`
+                + '酒馆在手机上不接受网页交包，自动绕行也没成功。'
+                + '只能手动导入：把中转里的备份存到手机的「文件」，'
+                + '再用酒馆自带的「数据迁移 → 导入」选中它',
+            );
+        }
+        jobId = staged.jobId;
+        cleanup = staged.cleanup;
     }
 
-    log('导入任务已提交：', jobId);
-    return waitForImportJob(jobId, fileName);
+    try {
+        return await waitForImportJob(jobId, fileName);
+    } finally {
+        // 这条路上包是**我们自己**暂存的（is_temporary 给的是 false），酒馆不会替我们删
+        await cleanup();
+    }
 }
 
 async function waitForImportJob(jobId, fileName) {

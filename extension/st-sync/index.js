@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.3';
+const EXT_VERSION = '2026-10-02.4';
 
 /**
  * 日志也往面板里记一份。
@@ -97,8 +97,8 @@ const TIMEOUT_MS = {
     // 而计时器是"整条链路总共"的预算，不是每一步的。放宽到 5 分钟，状态栏会显示进度，
     // 真卡住了也能从"数值不动"看出来，不用靠超时来兜。
     relayDownload: 300 * 1000,
-    // 分片下载时**每一块**的预算。允许 ≥17 KB/s 的慢块正常跑完（2 MB / 120s），
-    // 只有真正 0 字节卡死的块才会被掐掉、换新连接重试。
+    // 分片下载时**每一块**的预算。1 MB 的块给 120s，等于放行 ≥8.5 KB/s 的慢块；
+    // 只有"字节数不再增长"的块才会被掐掉、换新连接重试。
     chunk: 120 * 1000,
 };
 
@@ -111,7 +111,11 @@ const TIMEOUT_MS = {
  * 代码也不在带宽，是限速本身 —— 所以把包切块、多连接并发拉就能把总吞吐拉高十几倍。
  * 服务端那边靠 `Range` 回 206（见 relay/server.js 的 sendFile）。
  * ------------------------------------------------------------------ */
-const DOWNLOAD_CHUNK_SIZE = 2 * 1024 * 1024;        // 每块 2 MB
+// 每块 1 MB（原先是 2 MB）。2026-10-02 真机第二轮：6 条并发全部卡死，2 MB 块在 120s 内
+// 一块都没拉完 —— 说明 6 条并发下的**单条**有效速率远低于 PC 上测到的 35–53 KB/s，
+// 按"并发把总带宽摊薄"估，单条可能只有十几 KB/s。块砍半，跑完一块的时间就砍半，
+// 一样慢的网络也能在预算内收完；顺带进度更细、失败重试的代价也只有 1 MB。
+const DOWNLOAD_CHUNK_SIZE = 1024 * 1024;            // 每块 1 MB
 const DOWNLOAD_CONCURRENCY = 6;                     // 并发连接数（实测 6 条合计 3.2 MB/s）
 const DOWNLOAD_CHUNK_RETRIES = 3;                   // 每块最多重试次数（每次换新连接）
 const DOWNLOAD_PARALLEL_MIN_BYTES = 8 * 1024 * 1024; // 小于这个仍走单条流式（省连接开销）
@@ -200,7 +204,11 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
         log(`${what} 失败，用时 ${Date.now() - started}ms`, err);
         throw err;
     }
-    log(`${what} 响应头到达：HTTP ${res.status}，用时 ${Date.now() - started}ms`);
+    // 得单独记一笔。原来这里写的是 `Date.now() - started`，那只是"请求发出至今多久"，
+    // 跟头是什么时候到的没关系 —— 一超时就固定打印成"响应头 120002ms 前就到了"，
+    // 看着像"头早到了、body 卡住"，也可能压根没收到过头。拿这条日志排查会被带偏。
+    const headerAt = Date.now();
+    log(`${what} 响应头到达：HTTP ${res.status}，用时 ${headerAt - started}ms`);
 
     for (const method of ['text', 'json', 'blob', 'arrayBuffer']) {
         const original = res[method].bind(res);
@@ -212,7 +220,7 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
             } catch (err) {
                 if (isAbort(err)) {
                     // 这个分支就是 TT 手机端卡死的形态：头回来了、body 永远不结束
-                    log(`${what} 读 body 超时（响应头 ${Date.now() - started}ms 前就到了），已中断`);
+                    log(`${what} 读 body 超时（响应头是 ${Date.now() - headerAt}ms 前到的），已中断`);
                     throw timeoutError(what, timeoutMs);
                 }
                 log(`${what} 读 body 失败`, err);
@@ -583,11 +591,16 @@ async function relayPut(key, body, contentType) {
 /**
  * 拉一个分片。必须是 206；拿到 200 说明中转没升级到支持 Range，抛特定错误触发降级。
  * 长度对不上也抛 —— 宁可让这一块换新连接重试，也不要把半截数据拼进包里。
+ *
+ * onBytes(已收字节) 是可选的：**必须逐块读，不能用 arrayBuffer()**。
+ * arrayBuffer 一次性等完，中途一个反馈都没有，于是"按 20 KB/s 慢慢爬"和
+ * "一个字节都没来"在日志里长得完全一样 —— 真机上卡住时只能靠猜（2026-10-02 就是这么瞎猜了一轮）。
  */
-async function fetchChunk(key, start, end, signal) {
+async function fetchChunk(key, start, end, signal, onBytes) {
+    const want = end - start + 1;
     const res = await relayFetch(nsPath(null, key), {
         headers: { Range: `bytes=${start}-${end}` },
-        what: `中转分片 ${start}-${end}（${fmtBytes(end - start + 1)}）`,
+        what: `中转分片 ${start}-${end}（${fmtBytes(want)}）`,
         signal,
     }, TIMEOUT_MS.chunk);
 
@@ -603,12 +616,11 @@ async function fetchChunk(key, start, end, signal) {
         throw new Error(`下载 ${key} 分片 ${start}-${end} 失败 HTTP ${res.status}`);
     }
 
-    const buf = new Uint8Array(await res.arrayBuffer());
-    const want = end - start + 1;
-    if (buf.length !== want) {
-        throw new Error(`下载 ${key} 分片 ${start}-${end} 长度不对（期望 ${want}，实际 ${buf.length}）`);
+    const blob = await res.readBlob(onBytes ? (got) => onBytes(got) : null, want);
+    if (blob.size !== want) {
+        throw new Error(`下载 ${key} 分片 ${start}-${end} 长度不对（期望 ${want}，实际 ${blob.size}）`);
     }
-    return buf;
+    return blob;
 }
 
 /**
@@ -627,9 +639,25 @@ async function downloadChunked(key, size, { onProgress } = {}) {
     // 一条"整批作废"的信号：任一块定死就掐掉其余在途的分片。不掐的话它们会继续把
     // 几十 MB 拉完 —— 这些字节我们注定用不上，却会把同源那几条连接全占住。
     const controller = new AbortController();
-    let received = 0;
+    let received = 0;     // 已经完整拿到、确定要用的字节
     let next = 0;
     let failure = null;   // 第一个"真失败"，最后抛它（不是被连带掐断的那些）
+
+    // 在途分片的"已收字节"。光有 received 的话，进度只在**整块**回来时才跳一下；
+    // 一块 1 MB 按 30 KB/s 爬要半分钟，这半分钟状态栏纹丝不动 —— 和真卡死分不出来。
+    // 记在途字节就分得出了：数字在动="慢"，一直不动="卡"。
+    const inflight = new Map();
+    let lastReported = -1;
+    const report = () => {
+        if (!onProgress) return;
+        let done = received;
+        for (const bytes of inflight.values()) done += bytes;
+        // 只在真的变了才回调：同一块"先报在途、再报落账"是同一个数，
+        // 不去重的话进度序列会出现平台期，"是否单调递增"这类判断就全是噪声。
+        if (done === lastReported) return;
+        lastReported = done;
+        onProgress(done, size);
+    };
 
     // worker 一律不抛：失败只记进 failure 并拉闸，免得 Promise.all 抢着 reject、
     // 把真正的失败原因冲掉。
@@ -646,14 +674,25 @@ async function downloadChunked(key, size, { onProgress } = {}) {
             let lastErr = null;
             for (let attempt = 0; attempt <= DOWNLOAD_CHUNK_RETRIES; attempt += 1) {
                 if (attempt > 0) log(`分片 ${index} 第 ${attempt} 次重试（${start}-${end}）`);
+                inflight.set(index, 0);
                 try {
-                    const buf = await fetchChunk(key, start, end, controller.signal);
-                    slots[index] = buf;
-                    received += buf.length;
-                    if (onProgress) onProgress(received, size);
+                    const part = await fetchChunk(key, start, end, controller.signal, (got) => {
+                        inflight.set(index, got);
+                        report();
+                    });
+                    inflight.delete(index);
+                    slots[index] = part;
+                    // 注意是 .size 不是 .length：fetchChunk 回来的是 Blob，Blob 上没有 length，
+                    // 拿 undefined 去 += 会把整个进度变成 NaN（状态栏就成了"已下载 NaN"）。
+                    received += part.size;
+                    report();
                     lastErr = null;
                     break;
                 } catch (err) {
+                    // 这块这次作废了，它拉到的字节也不作数（重试会从 0 重新报），
+                    // 免得进度里一直挂着一份永远不会被拼进包的"幽灵字节"
+                    inflight.delete(index);
+                    report();
                     // 整批已经拉闸了，这条是被连带掐断的，不用报也不用重试
                     if (failure) return;
                     // 不支持 Range 是"整个中转的事"，不是这一块的错 —— 立刻抛给上层去降级，

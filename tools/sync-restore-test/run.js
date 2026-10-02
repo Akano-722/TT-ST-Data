@@ -60,6 +60,7 @@ const EXPORTS = [
     'DOWNLOAD_CHUNK_SIZE', 'DOWNLOAD_CONCURRENCY', 'DOWNLOAD_CHUNK_RETRIES',
     'DOWNLOAD_PARALLEL_MIN_BYTES',
     'EXT_VERSION', 'log', 'LOG_LINES', 'LOG_MAX_LINES', 'logText', 'beginBusy', 'endBusy',
+    'fmtBytes',
     // 上传绕行：拼 zip + 逐类读
     'buildZip', 'crc32', 'ZipReader', 'collectTtEntries', 'buildTtBackup', 'TT_API', 'TT_NO_READ_API',
     // 云侧的分类，用来验"上传拼出来的目录名云侧认不认"
@@ -772,16 +773,19 @@ async function testDetect(bad_) {
  * @param {number} o.failChunk   这一块的前 failTimes 次请求返回 500（验换新连接重试）
  * @param {number} o.failTimes   默认 1：只第一次失败
  * @param {number|Function} o.delayMs 每块的延迟（可给 index 的函数），用来控制谁先跑完
+ * @param {number} o.stallChunk  这一块回 206 但**体永远不结束**（验"卡住时报不报已收字节"）
+ * @param {number} o.stallBytes  stallChunk 卡住前先吐这么多字节；0 = 一个字节都没有
  */
 function makeRangeStub({
     size, ignoreRange = false, failChunk = -1, chunkSize, failTimes = 1, delayMs = 15, dangling = false,
+    stallChunk = -1, stallBytes = 0,
 }) {
     const body = Buffer.alloc(size);
     for (let i = 0; i < size; i += 1) body[i] = i & 0xff;
 
     const state = {
         inFlight: 0, maxInFlight: 0, requests: 0, attempts: new Map(),
-        ok: 0, aborted: 0, dangling: 0, cancelled: 0,
+        ok: 0, aborted: 0, dangling: 0, cancelled: 0, stalling: 0,
     };
     const delayOf = (index) => (typeof delayMs === 'function' ? delayMs(index) : delayMs);
 
@@ -829,6 +833,32 @@ function makeRangeStub({
             state.attempts.set(index, n);
             if (index === failChunk && n <= failTimes) return new Response('boom', { status: 500 });
 
+            if (index === stallChunk) {
+                // 头按 206 正常回，体先吐 stallBytes 字节，然后**就这么悬着**。
+                // 这正是真机上的形态：响应头到了、字节一个都不再涨。
+                state.stalling += 1;
+                return new Response(new ReadableStream({
+                    start(controller) {
+                        const head = body.subarray(start, Math.min(end + 1, start + stallBytes));
+                        if (head.length) controller.enqueue(head);
+                        // 真实 fetch 被 abort 时，读 body 也会立刻跟着报 AbortError；
+                        // 桩不照做的话 readBlob 会永远等下去，用例直接挂死。
+                        if (ac) {
+                            ac.addEventListener('abort', () => {
+                                controller.error(new DOMException('Aborted', 'AbortError'));
+                            }, { once: true });
+                        }
+                    },
+                    cancel() { state.cancelled += 1; },
+                }), {
+                    status: 206,
+                    headers: {
+                        'Content-Range': `bytes ${start}-${end}/${size}`,
+                        'Content-Type': 'application/octet-stream',
+                    },
+                });
+            }
+
             if (!ac || !ac.aborted) state.ok += 1;
             return new Response(body.subarray(start, end + 1), {
                 status: 206,
@@ -873,18 +903,21 @@ async function testChunkedDownload(bad_) {
     else if (!got.equals(body)) bad_('拼回来的字节和源不一致', '分片顺序或切片范围错了');
     else ok(`分片拼回的字节与源完全一致（${size} 字节 / ${Math.ceil(size / CHUNK)} 块）`);
 
-    if (seen.length !== Math.ceil(size / CHUNK)) {
-        bad_('进度回调次数不等于块数', `${seen.length} 次，块数 ${Math.ceil(size / CHUNK)}`);
+    // 现在每块**中途**也会报（在途字节），所以回调次数不再恰好等于块数，
+    // 只能要求"不少于块数"——比块数还少就说明有块回来时没报进度。
+    const blocks = Math.ceil(size / CHUNK);
+    if (seen.length < blocks) {
+        bad_('进度回调次数少于块数', `${seen.length} 次，块数 ${blocks}`);
     } else if (!seen.every(([, t]) => t === size)) {
         bad_('total 没用调用方给的 expectedSize', JSON.stringify(seen.slice(0, 2)));
     } else {
-        ok('每块回来都报一次进度，total 用的是 expectedSize');
+        ok(`进度每块至少报一次（共 ${seen.length} 次 / ${blocks} 块），total 用的是 expectedSize`);
     }
-    const rising = seen.every(([d], i) => i === 0 || d > seen[i - 1][0]);
+    const rising = seen.every(([d], i) => i === 0 || d >= seen[i - 1][0]);
     const finalDone = seen.length ? seen[seen.length - 1][0] : 0;
-    if (!rising) bad_('进度不是单调递增的', JSON.stringify(seen));
+    if (!rising) bad_('进度有回退', JSON.stringify(seen));
     else if (finalDone !== size) bad_('进度最终值不等于文件大小', `${finalDone} ≠ ${size}`);
-    else ok(`进度单调递增且收满（${finalDone} 字节）`);
+    else ok(`进度单调不减且收满（${finalDone} 字节）`);
 
     if (state.maxInFlight > CONC) {
         bad_('并发连接超过了上限', `峰值 ${state.maxInFlight} > ${CONC}`);
@@ -1041,6 +1074,86 @@ async function testChunkedFailureAbortsSiblings(bad_) {
         bad_('拉闸后还有请求在途或新发', `${requestsAtFailure} → ${state.requests}；这些连接会被白占`);
     } else {
         ok(`失败即收场，请求数停在 ${requestsAtFailure}（= ${CONC} 条首发 + ${RETRIES} 次坏块重试）`);
+    }
+}
+
+/**
+ * 分片卡住时，日志和进度必须说得出"已经收了多少字节"。
+ *
+ * 2026-10-02 真机第二轮全卡死，最要命的是**看不出是哪种卡**：`fetchChunk` 那时用
+ * `res.arrayBuffer()`，中途一个反馈都没有，于是"按 20 KB/s 慢慢爬"和"一个字节都没来"
+ * 在日志里长得一模一样（都只报一句"超时"）。这条用例把两种形态分开钉死：
+ * 卡住的块要在超时错误里带上已收字节数，并且这些**在途字节要先进进度**。
+ */
+async function testChunkStallReportsBytes(bad_) {
+    console.log('\n── 分片卡住：报出已收字节（分清"慢"和"死"）──');
+
+    const { api } = loadExtension({ fetchImpl: async () => json({}), seed: configSeed('http://relay.test') });
+    const CHUNK = api.DOWNLOAD_CHUNK_SIZE;
+    const CONC = api.DOWNLOAD_CONCURRENCY;
+    const size = CHUNK * (CONC + 3);
+    const stallChunk = 1;
+    const STALL_BYTES = 12345;
+
+    const { impl, state } = makeRangeStub({
+        size, chunkSize: CHUNK, stallChunk, stallBytes: STALL_BYTES, delayMs: 5,
+    });
+    const ext = loadExtension({ fetchImpl: impl, seed: configSeed('http://relay.test') });
+
+    // 只关心"卡住时报什么"，把每块预算压到 400ms，别让用例真等 2 分钟
+    ext.api.TIMEOUT_MS.chunk = 400;
+
+    const seen = [];
+    let err = null;
+    const { lines } = await withLogs(async () => {
+        try {
+            await ext.api.relayGetBlob('devices/cloud/snapshots/big.zip', {
+                expectedSize: size, onProgress: (done) => seen.push(done),
+            });
+        } catch (e) {
+            err = e;
+        }
+    });
+
+    if (!state.stalling) {
+        bad_('桩没造出"头回来了体不结束"的分片', '这条用例没验到该验的东西');
+    } else if (!err) {
+        bad_('分片卡住了却没报错', '会拿缺块的数据去拼出一个坏包');
+    } else if (!err.message.includes('超时')) {
+        // 抛出来的是"重试耗尽"的汇总错误，不是内层那条超时，所以看文案而不看标记
+        bad_('卡住报的不是超时', err.message);
+    } else if (!err.message.includes('已收')) {
+        bad_('超时错误里没写已收字节', `${err.message}；手机上分不出"慢"和"死"，只能瞎猜`);
+    } else if (!err.message.includes(api.fmtBytes(STALL_BYTES))) {
+        bad_('已收字节数不对', `期望 ${api.fmtBytes(STALL_BYTES)}，实际：${err.message}`);
+    } else {
+        ok(`卡住的块说清了已收 ${api.fmtBytes(STALL_BYTES)}：${err.message.slice(0, 72)}…`);
+    }
+
+    // 关键的一半：那 12 KB 在途字节得**先进过进度条**。只报落账字节的话，
+    // 卡住的块到死都是 0，状态栏从头到尾不动 —— 用户看到的还是"卡死了"。
+    const peak = seen.length ? Math.max(...seen) : 0;
+    if (peak < STALL_BYTES) {
+        bad_('在途字节没进进度', `进度峰值 ${peak} < 卡住块已收的 ${STALL_BYTES}；状态栏分不出慢和死`);
+    } else {
+        ok(`卡住块的 ${STALL_BYTES} 字节在途就已计入进度（峰值 ${peak}）`);
+    }
+
+    const logText_ = lines.join('\n');
+    if (!/读 body 超时（已收 \d+ 字节）/.test(logText_)) {
+        bad_('日志里没有"已收 N 字节"的那一行', logText_ || '（没有日志）');
+    } else {
+        ok('日志里留下了"读 body 超时（已收 N 字节）"');
+    }
+
+    // 假日志比没日志更坏：原来这里打的是 `Date.now() - started`（请求至今多久），
+    // 却写成"响应头 N ms 前就到了"——一超时必然打印成一个巨大的数，看着像"头早到了"。
+    if (!logText_.includes('响应头到达')) {
+        bad_('日志里没有记录响应头到达时刻', '这句本身不一定有问题，但少了它就没法核对');
+    } else if (/响应头 \d+ms 前就到了/.test(logText_)) {
+        bad_('又打出了"响应头 N ms 前就到了"这种不实的话', '那是请求至今的耗时，不是头的到达时刻');
+    } else {
+        ok('响应头到达时刻是真记的（用时 Xms），没有拿总耗时冒充');
     }
 }
 
@@ -1529,6 +1642,7 @@ async function main() {
     await testChunkedDownload(bad);
     await testChunkedFallback(bad);
     await testChunkedFailureAbortsSiblings(bad);
+    await testChunkStallReportsBytes(bad);
     await testTimeoutWiring(bad);
     await testDetect(bad);
     await testTavBranch(bad);

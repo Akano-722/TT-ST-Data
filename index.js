@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.5';
+const EXT_VERSION = '2026-10-02.6';
 
 /**
  * 日志也往面板里记一份。
@@ -97,10 +97,27 @@ const TIMEOUT_MS = {
     // 而计时器是"整条链路总共"的预算，不是每一步的。放宽到 5 分钟，状态栏会显示进度，
     // 真卡住了也能从"数值不动"看出来，不用靠超时来兜。
     relayDownload: 300 * 1000,
-    // 分片下载时**每一块**的预算。1 MB 的块给 120s，等于放行 ≥8.5 KB/s 的慢块；
-    // 只有"字节数不再增长"的块才会被掐掉、换新连接重试。
+    // 分片下载时**每一块**的预算。是"整块总共"的预算，不是"静默多久"的看门狗 ——
+    // 1 MB 的块给 120s，等于放行 ≥8.5 KB/s 的连接。
     chunk: 120 * 1000,
 };
+
+/**
+ * 上传的预算**按体积算**，因为浏览器根本不给上传进度 ——
+ * `fetch` 把请求体交出去之后，发了多少字节是看不见的，所以做不了"空闲看门狗"
+ * （下载那边能逐块读、知道字节在不在动，上传这边不行）。只剩"按最低可容忍速度估一个总预算"这一条路。
+ *
+ * 原来上传用的是 TIMEOUT_MS.relay（60s）：150 MB 得跑到 2.5 MB/s 才不超时。
+ * 2026-10-02 真机实测，手机在没代理的网络上传到 6 MB 就被这个 60s 掐了，
+ * 而链路其实还在动（约 100 KB/s，只是慢）。那不是网络断，是我们的表。
+ */
+const UPLOAD_MIN_BYTES_PER_SEC = 32 * 1024;   // 低于这个速度才认为"这上传没救了"
+
+function uploadTimeoutFor(size) {
+    const bytes = Number(size) || 0;
+    if (!bytes) return TIMEOUT_MS.relay;
+    return Math.max(TIMEOUT_MS.relay, Math.ceil(bytes / UPLOAD_MIN_BYTES_PER_SEC) * 1000);
+}
 
 /* ------------------------------------------------------------------ *
  * 分片并行下载
@@ -593,11 +610,19 @@ async function readJsonSafe(response) {
 }
 
 async function relayPut(key, body, contentType) {
+    // body 可能是 Blob（大备份）或字符串（latest.json 那种小 JSON），只有 Blob 有 .size。
+    const bytes = body && typeof body.size === 'number' ? body.size : 0;
+    const timeoutMs = uploadTimeoutFor(bytes);
     const res = await relayFetch(nsPath(null, key), {
         method: 'PUT',
         headers: { 'Content-Type': contentType || 'application/octet-stream' },
         body,
-    });
+        // 上传是唯一一个"卡住了也没有中间反馈"的环节，只能靠这行日志让人看出
+        // "预算给了多久"——否则超时了就只看到一句"超时"，分不出是网慢还是预算给少了。
+        what: bytes
+            ? `上传 ${key}（${fmtBytes(bytes)}，超时 ${Math.round(timeoutMs / 1000)}s）`
+            : `上传 ${key}`,
+    }, timeoutMs);
     const json = await readJsonSafe(res);
     if (!res.ok) throw new Error(`上传 ${key} 失败 HTTP ${res.status}：${json.error || JSON.stringify(json).slice(0, 200)}`);
     return json;

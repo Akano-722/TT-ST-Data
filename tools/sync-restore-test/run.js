@@ -60,7 +60,7 @@ const EXPORTS = [
     'DOWNLOAD_CHUNK_SIZE', 'DOWNLOAD_CONCURRENCY', 'DOWNLOAD_CHUNK_RETRIES',
     'DOWNLOAD_PARALLEL_MIN_BYTES',
     'EXT_VERSION', 'log', 'LOG_LINES', 'LOG_MAX_LINES', 'logText', 'beginBusy', 'endBusy',
-    'fmtBytes',
+    'fmtBytes', 'uploadTimeoutFor',
     // 上传绕行：拼 zip + 逐类读
     'buildZip', 'crc32', 'ZipReader', 'collectTtEntries', 'buildTtBackup', 'TT_API', 'TT_NO_READ_API',
     // 云侧的分类，用来验"上传拼出来的目录名云侧认不认"
@@ -453,6 +453,20 @@ async function testTimeoutWiring(bad_) {
         if (api.TIMEOUT_MS.chunk !== 120000) {
             bad('分片超时不是 120s', String(api.TIMEOUT_MS.chunk));
         } else ok('TIMEOUT_MS.chunk = 120s（每块单独预算，慢块能跑完、死块才被换掉）');
+
+        // 上传的预算得按体积算。固定 60s 意味着 150 MB 要跑 2.5 MB/s 才不超时 ——
+        // 真机上手机慢到 100 KB/s 时，传到 6 MB 就被自己的表掐了（链路其实还在动）。
+        const t = api.uploadTimeoutFor;
+        const cases = [
+            [0, 60000, '没给体积时退回 60s'],
+            [1024 * 1024, 60000, '小文件不放大（60s 就是下限）'],
+            [150 * 1024 * 1024, Math.ceil((150 * 1024 * 1024) / (32 * 1024)) * 1000, '150 MB 按 32 KB/s 折算'],
+        ];
+        const wrong = cases.find(([size, want]) => t(size) !== want);
+        if (typeof t !== 'function') bad('uploadTimeoutFor 没导出', String(t));
+        else if (wrong) bad('上传预算算错了', `${wrong[0]} 字节 → ${t(wrong[0])}ms（期望 ${wrong[1]}ms，${wrong[2]}）`);
+        else if (t(150 * 1024 * 1024) <= 60000) bad('大文件上传预算没放大', '固定 60s 会把"慢但在动"的上传掐死');
+        else ok(`上传预算按体积放：150 MB → ${Math.round(t(150 * 1024 * 1024) / 1000)}s（原来固定 60s）`);
 
         // 真正打一次，从日志里确认走的是 180s 那个值
         const { value, lines } = await withLogs(() => api.buildLocalBackup());

@@ -51,7 +51,7 @@ function bad(label, detail) {
 
 /** 从源码里抠出来的内部函数。加名字之前确认它确实是顶层函数声明/const。 */
 const EXPORTS = [
-    'timedFetch', 'relayFetch', 'buildLocalBackup', 'stFetch', 'stMustOk',
+    'timedFetch', 'relayFetch', 'relayGetBlob', 'buildLocalBackup', 'stFetch', 'stMustOk',
     'pullOne', 'restoreFromZip', 'restoreViaNativeImport', 'waitForImportJob',
     'isTauriTavern', 'restoreModeHint', 'settings', 'STATE', 'TIMEOUT_MS', 'DM_API',
     'JOB_POLL_INTERVAL_MS', 'JOB_TIMEOUT_MS',
@@ -155,8 +155,11 @@ async function withLogs(fn) {
  * mode:
  *   hang-headers —— 连响应头都不回（最朴素的卡死）
  *   hang-body    —— 回了头、发了一小段就再也不发（**TT 上就是这么卡的**）
+ *   slow-body    —— 带着 Content-Length 一块一块慢慢发完（模拟手机上下大备份）
  *   ok           —— 正常回一段 JSON
  */
+const SLOW_BODY_SIZE = 5 * 4096;   // 5 块 × 4 KB，够看出进度在涨
+
 function startServer(mode) {
     const state = { aborted: false, requests: [] };
     const server = http.createServer((req, res) => {
@@ -172,6 +175,25 @@ function startServer(mode) {
             res.writeHead(200, { 'Content-Type': 'application/zip' });
             res.write('PK\x03\x04');   // 头和数据都出去了，fetch 会 resolve
             return;                     // 但永远不 end()
+        }
+
+        if (mode === 'slow-body') {
+            const chunk = Buffer.alloc(4096, 0x41);
+            res.writeHead(200, {
+                'Content-Type': 'application/zip',
+                'Content-Length': String(SLOW_BODY_SIZE),
+            });
+            let sent = 0;
+            const tick = setInterval(() => {
+                res.write(chunk);
+                sent += chunk.length;
+                if (sent >= SLOW_BODY_SIZE) {
+                    clearInterval(tick);
+                    res.end();
+                }
+            }, 20);
+            res.on('close', () => clearInterval(tick));
+            return;
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -284,6 +306,101 @@ async function testTimeoutHangingBody(bad_) {
     }
 }
 
+/**
+ * 下载整份备份：走逐块读，进度要报出来，超时要用放宽后的那个值。
+ * 起因：手机上 80 MB 的包在 60s 里传不完，而状态栏只有一个"已 N 秒"，
+ * 分不出是网慢还是卡死 —— 所以既要放宽超时，也要能把字节数显出来。
+ */
+async function testDownloadProgress(bad_) {
+    console.log('\n── relayGetBlob：下载进度 ──');
+    const srv = await startServer('slow-body');
+    try {
+        const { api } = loadExtension({
+            fetchImpl: (url, opts) => fetch(url, opts),
+            seed: configSeed(srv.url),
+        });
+
+        const seen = [];
+        const { value: blob, lines } = await withLogs(() => api.relayGetBlob(
+            'devices/cloud/snapshots/x.zip',
+            {
+                expectedSize: SLOW_BODY_SIZE,
+                onProgress: (done, total) => seen.push([done, total]),
+            },
+        ));
+
+        if (!(blob instanceof Blob)) bad('没返回 Blob', String(blob));
+        else if (blob.size !== SLOW_BODY_SIZE) {
+            bad('逐块读回来的字节数不对', `${blob.size} ≠ ${SLOW_BODY_SIZE}`);
+        } else ok('逐块读回来的字节和 Content-Length 一致', `${blob.size} 字节`);
+
+        if (seen.length < 2) bad('进度回调没被多次调用', `只调了 ${seen.length} 次`);
+        else ok('进度回调按块触发', `${seen.length} 次`);
+
+        const rising = seen.every(([d], i) => i === 0 || d > seen[i - 1][0]);
+        if (!rising) bad('进度不是单调递增的', JSON.stringify(seen));
+        else ok('进度单调递增', `${seen[0][0]} → ${seen[seen.length - 1][0]}`);
+
+        if (!seen.every(([, t]) => t === SLOW_BODY_SIZE)) {
+            bad('total 没用调用方给的 expectedSize', JSON.stringify(seen.slice(0, 2)));
+        } else ok('total 用的是调用方给的 expectedSize（不是等 Content-Length）');
+
+        if (!lines.some((l) => l.includes('超时 300s'))) {
+            bad('下载没挂上放宽后的 300s 超时', lines.join(' | ') || '（没有日志）');
+        } else ok('下载按 300s 计时，不再被别人的 60s 掐断');
+    } finally {
+        await srv.close();
+    }
+}
+
+/** body 半路卡住时，报错和日志都要带上"已经收了多少"，否则没法判断是死了还是慢 */
+async function testDownloadStallKeepsBytes(bad_) {
+    console.log('\n── 下载半路卡住：得说清卡在哪、收了多少 ──');
+    const srv = await startServer('hang-body');
+    try {
+        const { api } = loadExtension({
+            fetchImpl: (url, opts) => fetch(url, opts),
+            seed: configSeed(srv.url),
+        });
+
+        // 这里刻意不走 relayGetBlob：它现在挂的是 300s，真等下去测试要跑五分多钟。
+        // 测的是同一条 readBlob 代码路径，只是自己指定一个能立刻触发的小超时。
+        const res = await api.timedFetch(`${srv.url}/v1/ns/A/tavern/x.zip`, {}, {
+            timeoutMs: 500, what: '测试下载流',
+        });
+
+        const seen = [];
+        let err = null;
+        const { lines } = await withLogs(async () => {
+            try {
+                await res.readBlob((done, total) => seen.push([done, total]), 123456);
+            } catch (e) {
+                err = e;
+            }
+        });
+
+        if (!err) bad('body 一直不结束却没超时', '计时器被提前清掉了 —— 卡死会重现');
+        else if (!err.isTimeout) bad('body 读挂了但没标成超时', err.message);
+        else if (!err.message.includes('已收 4 B')) {
+            bad('报错没说清已经收了多少', `${err.message}；手机上只能看这行，分不出卡住还是慢`);
+        } else ok('卡住的下载按预期超时，且报错带上了已收字节', err.message);
+
+        if (!seen.length || seen[0][0] !== 4) {
+            bad('卡住前收到的字节没报给进度回调', JSON.stringify(seen));
+        } else ok('卡住前收到的 4 字节已经报出去了', JSON.stringify(seen));
+
+        if (!lines.some((l) => l.includes('已收 4 字节'))) {
+            bad('超时日志里没写已收字节', lines.join(' | ') || '（没有日志）');
+        } else ok('超时日志带上了已收字节，能看出是"卡住"而不是"慢"');
+
+        if (!(await waitFor(() => srv.state.aborted))) {
+            bad('卡住后连接没被掐断', '那个流还占着连接');
+        } else ok('超时后连接也被掐断了');
+    } finally {
+        await srv.close();
+    }
+}
+
 /** 中转请求超时，不能被包成"连不上中转服务"（那会把人往错误方向查） */
 async function testRelayTimeoutWording(bad_) {
     console.log('\n── relayFetch：超时的文案要能区分开 ──');
@@ -323,6 +440,10 @@ async function testTimeoutWiring(bad_) {
         if (api.TIMEOUT_MS.relay !== 60000 || api.TIMEOUT_MS.st !== 60000) {
             bad('中转/酒馆超时不是 60s', JSON.stringify(api.TIMEOUT_MS));
         } else ok('TIMEOUT_MS.relay / st = 60s');
+        // 下载整份备份走的是单独放宽的那个值，不能和普通中转请求共用一个 60s
+        if (api.TIMEOUT_MS.relayDownload !== 300000) {
+            bad('下载备份的超时不是 300s', String(api.TIMEOUT_MS.relayDownload));
+        } else ok('TIMEOUT_MS.relayDownload = 300s（手机上 80 MB 的包 60s 传不完）');
 
         // 真正打一次，从日志里确认走的是 180s 那个值
         const { value, lines } = await withLogs(() => api.buildLocalBackup());
@@ -1109,6 +1230,8 @@ async function main() {
     await testTimeoutNoHeaders(bad);
     await testTimeoutHangingBody(bad);
     await testRelayTimeoutWording(bad);
+    await testDownloadProgress(bad);
+    await testDownloadStallKeepsBytes(bad);
     await testTimeoutWiring(bad);
     await testDetect(bad);
     await testTavBranch(bad);

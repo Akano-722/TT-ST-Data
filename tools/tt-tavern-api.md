@@ -298,6 +298,42 @@ GET /api/extensions/data-migration/job?id=<job_id>
 - zip 是**自己拼的 store-only**（method 0）：`buildZip()` + `crc32()`，纯函数、零依赖。云侧 `ZipReader` 对 method 0 原样返回、不校验 CRC，但 CRC 仍按标准写对（Python `zipfile.testzip()` 校验通过、中文名按 UTF-8 正确还原）。
 - 整包在内存里拼（和云侧现状一致），大账号有风险；没做流式。
 
+### 🔧 手机拉取 80 MB 备份在 60s 超时（2026-10-02.1 修）
+
+**症状**：手机上点「从中转恢复」拉 cloud 的备份，面板日志卡在
+`中转 GET /v1/ns/A/tavern/devices/cloud/snapshots/xxx.zip` 的**读 body** 那一步，60 秒后中断。
+
+**根因不是卡死，是超时值给小了**：`timedFetch` 的计时器**从 `fetch()` 起算、到 body 读完才清**
+（`index.js` 里 `clearTimeout` 在包 body 的 `finally` 里），所以它是**整条链路总共**的预算，
+不是每一步的。而这条下载走的是 `TIMEOUT_MS.relay = 60s` —— 和中转的列目录、读 latest.json
+这些小请求共用一个值。这次 cloud 侧的包**只有 80 多 MB**，手机网络下 60 秒传不完。
+
+对照：同一台手机 2026-10-01 那次 PUT 上去的包是 141 MB，当时 `TIMEOUT_MS.relay = 60s`
+"够用"（上面「真机首跑」里写的）—— 那次是在临界点上侥幸过了，不是这个值合理。
+中转服务本身没问题：`relay/server.js` 带 `Content-Length` 且 `stream.pipeline` 流式发，
+响应头几毫秒就回来（日志里能看到「响应头到达」用时很短），慢的是 body。
+
+**修法**（不改成"停滞超时"，先按最直接的来）：
+
+1. `TIMEOUT_MS.relayDownload = 300s` 单独给整份备份下载，普通中转请求仍是 60s（失败报得快）。
+   `relayFetch(pathname, options, timeoutMs)` 加第三个参数，只有 `relayGetBlob` 传新值。
+2. `timedFetch` 给响应加 `res.readBlob(onProgress, expectedSize)`：用 `res.body.getReader()` 逐块读，
+   每收一块报一次进度（total 优先用调用方给的 `latest.size`，否则退回 `Content-Length`）。
+   `res.blob()` 是一次性的，中途拿不到任何反馈。
+3. `pullOne` 把进度写进 `STATE.download`，`renderStatus` 显示
+   `⏳ 正在下载 xxx.zip…　12.4 MB / 83.1 MB（14%）　已 96 秒`。
+   界面靠 `beginBusy` 那个每秒 ticker 重画，不用另开定时器。
+4. 超时文案带上已收字节（`超时：N 秒没有新数据，已收 12.4 MB`）——
+   已经收到过字节还说"没有响应"是句误导的话，手机上只能看这一行，得能分出卡住还是慢。
+
+**顺手记一笔**：上传侧 `relayPut` 也是 60s，141 MB 那次同样贴着线过。这次没动它
+（标准 `fetch` 拿不到上传进度，要显示得上 XMLHttpRequest，另议），但如果手机上再出现
+"上传到一半没反应"，第一个该怀疑的就是它。
+
+**测试**：`tools/sync-restore-test/run.js` 加了两条 —— `slow-body` 服务器（带 `Content-Length`
+分块慢发）验进度回调单调递增、字节数对得上、走的是 300s；`hang-body` 验半路卡住时
+报错里带上了"已收 N 字节"、连接被真掐断。超时值接线那条也加了 `relayDownload = 300s` 的断言。
+
 ### 怎么再查 TT 源码（本机网络限制的解法）
 
 - `raw.githubusercontent.com` 本机 DNS 被挡；`api.github.com` 能通但**每小时只有 60 次**（很容易撞 rate limit）；`github.com` 的 tarball 会重定向到 codeload，本机到 codeload 大约 25 KB/s —— 整仓（>50 MB）拉不完。

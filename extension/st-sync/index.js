@@ -143,14 +143,24 @@ function isAbort(err) {
 /**
  * received > 0 时文案换一种说法：已经收到过字节了，说"没有响应"是误导 ——
  * 它明明响应了、只是半路停住。手机上只能看这一行，得能分出"卡住"和"慢"。
+ *
+ * idleMs 是"最后一块数据距今多久"，只有调用方真的记了这个时刻才传。
+ * **不要拿 timeoutMs 冒充它**：那个计时器是"整条链路总共给多少秒"的总预算，
+ * 不是"静默多久就掐"的看门狗。写成"N 秒没有新数据"会把人往"中途卡住"上带，
+ * 而真相可能是"从头到尾就没动过"（2026-10-02 就为这句话多绕了一轮）。
  */
-function timeoutError(what, timeoutMs, received = 0) {
+function timeoutError(what, timeoutMs, received = 0, idleMs = null) {
     const seconds = timeoutMs / 1000;
     // 不取整：测试里挂的是几百毫秒，取整会变成"0 秒没有响应"
     const shown = Number.isInteger(seconds) ? seconds : seconds.toFixed(1);
-    const err = new Error(received
-        ? `${what} 超时：${shown} 秒没有新数据，已收 ${fmtBytes(received)}，已中断`
-        : `${what} 超时：${shown} 秒没有响应，已中断`);
+    let detail;
+    if (!received) {
+        detail = '没有响应';
+    } else {
+        const idle = Number.isFinite(idleMs) ? `，最后一块数据是 ${(idleMs / 1000).toFixed(1)} 秒前` : '';
+        detail = `没下完，已收 ${fmtBytes(received)}${idle}`;
+    }
+    const err = new Error(`${what} 超时：${shown} 秒${detail}，已中断`);
     err.isTimeout = true;
     return err;
 }
@@ -258,6 +268,9 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
         const reader = res.body.getReader();
         const chunks = [];
         let received = 0;
+        // 最后一块数据是什么时候到的。有了它才能说清"是慢慢爬被总预算掐了"
+        // 还是"收了几百字节之后彻底不动了"—— 这两种在手机上要对症下药的方向完全不同。
+        let lastByteAt = started;
 
         try {
             for (;;) {
@@ -266,14 +279,16 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
                 if (!value || !value.length) continue;
                 chunks.push(value);
                 received += value.length;
+                lastByteAt = Date.now();
                 if (onProgress) onProgress(received, total);
             }
             log(`${what} body 读完，总共 ${Date.now() - started}ms，${received} 字节`);
             return new Blob(chunks);
         } catch (err) {
             if (isAbort(err)) {
-                log(`${what} 读 body 超时（已收 ${received} 字节），已中断`);
-                throw timeoutError(what, timeoutMs, received);
+                const idleMs = received ? Date.now() - lastByteAt : null;
+                log(`${what} 读 body 超时（已收 ${received} 字节${Number.isFinite(idleMs) ? `，最后一块数据是 ${(idleMs / 1000).toFixed(1)} 秒前` : ''}），已中断`);
+                throw timeoutError(what, timeoutMs, received, idleMs);
             }
             log(`${what} 读 body 失败（已收 ${received} 字节）`, err);
             throw err;

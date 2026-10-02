@@ -1140,10 +1140,18 @@ async function testChunkStallReportsBytes(bad_) {
     }
 
     const logText_ = lines.join('\n');
-    if (!/读 body 超时（已收 \d+ 字节）/.test(logText_)) {
+    if (!/读 body 超时（已收 \d+ 字节/.test(logText_)) {
         bad_('日志里没有"已收 N 字节"的那一行', logText_ || '（没有日志）');
     } else {
-        ok('日志里留下了"读 body 超时（已收 N 字节）"');
+        ok('日志里留下了"读 body 超时（已收 N 字节…）"');
+    }
+
+    // "总预算到点了"和"中途没数据了"必须能分开。原来那句"N 秒没有新数据"打的是
+    // timeoutMs（总预算），不是真的静默时长 —— 会把人往"中途卡住"上带。
+    if (!/最后一块数据是 [\d.]+ 秒前/.test(logText_)) {
+        bad_('日志没说"最后一块数据是多久前"', `分不出"从头就没动"和"跑到一半停住"：${logText_}`);
+    } else {
+        ok('日志里记了最后一块数据距今多久（idle 和"总预算"分得开）');
     }
 
     // 假日志比没日志更坏：原来这里打的是 `Date.now() - started`（请求至今多久），

@@ -58,6 +58,10 @@ Zeabur 是从 Git 仓库拉代码部署的，所以先得有个远程仓库。�
 ```bash
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
+
+# 中转那边是从 relay 分支部署的（见 2.3），所以这个分支也得推
+git subtree split --prefix=relay -b relay
+git push origin relay
 ```
 
 #### 2.2 本地先跑通（可选，但建议）
@@ -70,18 +74,24 @@ npm start
 ```
 
 ```bash
-npm test                  # 34 项冒烟测试：接口、鉴权、命名空间隔离、路径穿越全打一遍
+npm test                  # 41 项冒烟测试：接口、鉴权、命名空间隔离、路径穿越、Range 分片全打一遍
 ```
 
 #### 2.3 部署到 Zeabur
 
-1. 新建服务，选刚推上去的仓库。**Root Directory 必须填 `relay`** —— 这是 monorepo，
-   仓库根没有 `package.json`。不填的话 Zeabur 会在仓库根找 Dockerfile，找不到就走进自动识别，
-   结果不对（比如当成纯 Node 项目跑 `npm start`，然后构建失败）。
+1. 新建服务，选刚推上去的仓库。**分支填 `relay`，Root Directory 留空。**
+   仓库虽然是 monorepo，但 `relay` 分支是 `git subtree split --prefix=relay` 切出来的，
+   **根目录就是中转服务本身**（`Dockerfile`、`package.json`、`server.js` 都在根上）。
+   所以 Root Directory 再填 `relay` 反而会错——那样 Zeabur 会去找 `relay/relay/`，
+   找不到就走进自动识别，构建出来的东西不对。
 2. **挂持久卷**：服务页 → Volumes → 挂载目录填 `/data`。
    ⚠️ 不做这步的话，容器一重启所有备份都没了。挂载时该目录会被清空，首次部署无所谓。
 3. 配环境变量，`DATA_DIR=/data`、`BOOTSTRAP_NAMESPACE=A` 这两个是必须的，其余看下表。
 4. 部署完成后看**日志**，第一次启动会打印命名空间 `A` 的访问令牌。**只打印这一次**，立刻复制保存。
+
+> **改完中转怎么发版**：Zeabur 拉的是 `relay` 分支，**光推 `main` 不会生效**。
+> 得重新切一次：`git branch -D relay && git subtree split --prefix=relay -b relay && git push origin relay`。
+> 只改扩展（`extension/st-sync/`）时不用走这套。
 
 #### 2.4 环境变量
 
@@ -262,7 +272,8 @@ git push origin extension
   角色画廊图、向量库、扩展私有文件这三类酒馆没提供写入接口，还原不了。
   TT 那条原生整包导入**不保证**这些——它怎么合并是酒馆后端的事，我们没读到结论，
   所以扩展里也没敢写这种承诺（见 `tools/tt-tavern-api.md` 第 6 节）。
-- 所有请求都有超时（中转/酒馆普通请求 60s，酒馆打包下载 180s，**从中转下载备份 300s**）。
+- 所有请求都有超时（中转/酒馆普通请求 60s，酒馆打包下载 180s，**从中转下载备份 300s**，
+  大文件走分片时**每个分片各 120s**）。
   超时是必需的：TT 手机端上读 `POST /api/users/backup` 那个大流时 fetch 可能永远不返回，
   没有超时整个扩展会卡死。下载那 300s 是单独的——手机上 80 MB 的包 60s 传不完（2026-10-02 实测），
   而且下载时状态栏会显示进度，能分清"网慢"和"卡住"。

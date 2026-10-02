@@ -55,6 +55,10 @@ const EXPORTS = [
     'pullOne', 'restoreFromZip', 'restoreViaNativeImport', 'waitForImportJob',
     'isTauriTavern', 'restoreModeHint', 'settings', 'STATE', 'TIMEOUT_MS', 'DM_API',
     'JOB_POLL_INTERVAL_MS', 'JOB_TIMEOUT_MS',
+    // 分片并发下载
+    'fetchChunk', 'downloadChunked', 'isRangeUnsupported',
+    'DOWNLOAD_CHUNK_SIZE', 'DOWNLOAD_CONCURRENCY', 'DOWNLOAD_CHUNK_RETRIES',
+    'DOWNLOAD_PARALLEL_MIN_BYTES',
     'EXT_VERSION', 'log', 'LOG_LINES', 'LOG_MAX_LINES', 'logText', 'beginBusy', 'endBusy',
     // 上传绕行：拼 zip + 逐类读
     'buildZip', 'crc32', 'ZipReader', 'collectTtEntries', 'buildTtBackup', 'TT_API', 'TT_NO_READ_API',
@@ -444,6 +448,10 @@ async function testTimeoutWiring(bad_) {
         if (api.TIMEOUT_MS.relayDownload !== 300000) {
             bad('下载备份的超时不是 300s', String(api.TIMEOUT_MS.relayDownload));
         } else ok('TIMEOUT_MS.relayDownload = 300s（手机上 80 MB 的包 60s 传不完）');
+        // 分片是每块单独计时的，不能和整份的那个 300s 共用一个值
+        if (api.TIMEOUT_MS.chunk !== 120000) {
+            bad('分片超时不是 120s', String(api.TIMEOUT_MS.chunk));
+        } else ok('TIMEOUT_MS.chunk = 120s（每块单独预算，慢块能跑完、死块才被换掉）');
 
         // 真正打一次，从日志里确认走的是 180s 那个值
         const { value, lines } = await withLogs(() => api.buildLocalBackup());
@@ -748,6 +756,176 @@ async function testDetect(bad_) {
     } else {
         ok('恢复说明分平台，TT 侧如实说是原生整包导入');
     }
+}
+
+/* ------------------------------------------------ 分片并行下载（Range） */
+
+/**
+ * 造一份**会处理 Range** 的中转下载桩。
+ *
+ * 为什么要自己造：真实中转的限速是"按连接"的，本地起服务器复现不了那种形态；
+ * 但分片这条路上真正要钉死的是**逻辑**——切块对不对、并发有没有超、进度单不单调、
+ * 失败换不换连接、拿到 200 会不会降级。这些用桩都能精确验，而且可控（哪个块失败自己说了算）。
+ *
+ * @param {number} o.size        文件总字节
+ * @param {boolean} o.ignoreRange true → 当"中转没升级"，无视 Range 回整份 200
+ * @param {number} o.failChunk   这一块第一次请求返回 500（验换新连接重试）
+ */
+function makeRangeStub({ size, ignoreRange = false, failChunk = -1, chunkSize }) {
+    const body = Buffer.alloc(size);
+    for (let i = 0; i < size; i += 1) body[i] = i & 0xff;
+
+    const state = { inFlight: 0, maxInFlight: 0, requests: 0, attempts: new Map(), ok: 0 };
+
+    const impl = async (url, opts) => {
+        state.inFlight += 1;
+        state.requests += 1;
+        state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+        try {
+            // 一点延迟，保证并发请求真的会重叠，maxInFlight 才有意义
+            await new Promise((r) => setTimeout(r, 15));
+
+            const headers = (opts && opts.headers) || {};
+            const range = headers.Range || headers.range;
+            if (ignoreRange || !range) {
+                return new Response(body, { status: 200, headers: { 'Content-Type': 'application/zip' } });
+            }
+
+            const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+            if (!match) throw new Error(`桩收到了不认识的 Range：${range}`);
+            const start = Number(match[1]);
+            const end = Number(match[2]);
+
+            const index = Math.floor(start / chunkSize);
+            const n = (state.attempts.get(index) || 0) + 1;
+            state.attempts.set(index, n);
+            if (index === failChunk && n === 1) return new Response('boom', { status: 500 });
+
+            state.ok += 1;
+            return new Response(body.subarray(start, end + 1), {
+                status: 206,
+                headers: {
+                    'Content-Range': `bytes ${start}-${end}/${size}`,
+                    'Content-Type': 'application/octet-stream',
+                },
+            });
+        } finally {
+            state.inFlight -= 1;
+        }
+    };
+
+    return { impl, state, body };
+}
+
+/** 大文件：必须切块并发拉，拼回来的字节和进度都要对，某块失败要换连接重试 */
+async function testChunkedDownload(bad_) {
+    console.log('\n── relayGetBlob：分片并发下载 ──');
+
+    const { api } = loadExtension({ fetchImpl: async () => json({}), seed: configSeed('http://relay.test') });
+    const CHUNK = api.DOWNLOAD_CHUNK_SIZE;
+    const CONC = api.DOWNLOAD_CONCURRENCY;
+    const size = CHUNK * (CONC + 3);          // 比并发数多几块，好看出工作池轮转
+    const failChunk = 3;
+
+    const { impl, state, body } = makeRangeStub({ size, failChunk, chunkSize: CHUNK });
+    const ext = loadExtension({ fetchImpl: impl, seed: configSeed('http://relay.test') });
+
+    const seen = [];
+    const { value: blob, lines } = await withLogs(() => ext.api.relayGetBlob(
+        'devices/cloud/snapshots/big.zip',
+        { expectedSize: size, onProgress: (done, total) => seen.push([done, total]) },
+    ));
+
+    if (!(blob instanceof Blob)) {
+        bad_('没返回 Blob', String(blob));
+        return;
+    }
+    const got = Buffer.from(await blob.arrayBuffer());
+    if (got.length !== size) bad_('拼回来的大小不对', `${got.length} ≠ ${size}`);
+    else if (!got.equals(body)) bad_('拼回来的字节和源不一致', '分片顺序或切片范围错了');
+    else ok(`分片拼回的字节与源完全一致（${size} 字节 / ${Math.ceil(size / CHUNK)} 块）`);
+
+    if (seen.length !== Math.ceil(size / CHUNK)) {
+        bad_('进度回调次数不等于块数', `${seen.length} 次，块数 ${Math.ceil(size / CHUNK)}`);
+    } else if (!seen.every(([, t]) => t === size)) {
+        bad_('total 没用调用方给的 expectedSize', JSON.stringify(seen.slice(0, 2)));
+    } else {
+        ok('每块回来都报一次进度，total 用的是 expectedSize');
+    }
+    const rising = seen.every(([d], i) => i === 0 || d > seen[i - 1][0]);
+    const finalDone = seen.length ? seen[seen.length - 1][0] : 0;
+    if (!rising) bad_('进度不是单调递增的', JSON.stringify(seen));
+    else if (finalDone !== size) bad_('进度最终值不等于文件大小', `${finalDone} ≠ ${size}`);
+    else ok(`进度单调递增且收满（${finalDone} 字节）`);
+
+    if (state.maxInFlight > CONC) {
+        bad_('并发连接超过了上限', `峰值 ${state.maxInFlight} > ${CONC}`);
+    } else if (state.maxInFlight < 2) {
+        bad_('根本没并发起来', `峰值 ${state.maxInFlight}；这条路上并行才是重点`);
+    } else {
+        ok(`并发峰值 ${state.maxInFlight} ≤ ${CONC}，确实并发在拉`);
+    }
+
+    // 某块第一次失败：必须换新连接重试，而且最终要成功
+    if ((state.attempts.get(failChunk) || 0) !== 2) {
+        bad_('失败块没有重试', `第 ${failChunk} 块请求了 ${state.attempts.get(failChunk) || 0} 次`);
+    } else {
+        ok(`第 ${failChunk} 块首失败后换新连接重试并成功`);
+    }
+
+    // 走上分片就该先打日志说明，手机上出问题能对着面板看
+    if (!lines.join('\n').includes('分片下载：')) {
+        bad_('没在日志里说明走了分片下载', lines.join(' | ') || '（没有日志）');
+    } else {
+        ok('日志里说明了这次走的是分片下载');
+    }
+
+    if (typeof api.isRangeUnsupported !== 'function' || api.isRangeUnsupported(new Error('x'))) {
+        bad_('isRangeUnsupported 判定写反了', '普通的错会被当成"中转不支持 Range"去降级');
+    } else {
+        ok('isRangeUnsupported 只认带标记的错误，普通错误不会被误判');
+    }
+}
+
+/** 中转没升级（无视 Range 回 200）：不能死，要降级回单条流式，最终仍拿到完整数据 */
+async function testChunkedFallback(bad_) {
+    console.log('\n── 中转没升级：分片降级回单条流式 ──');
+
+    const { api } = loadExtension({ fetchImpl: async () => json({}), seed: configSeed('http://relay.test') });
+    const size = api.DOWNLOAD_PARALLEL_MIN_BYTES;   // 刚好踩到并行阈值
+
+    const { impl, body } = makeRangeStub({ size, ignoreRange: true, chunkSize: api.DOWNLOAD_CHUNK_SIZE });
+    const ext = loadExtension({ fetchImpl: impl, seed: configSeed('http://relay.test') });
+
+    const seen = [];
+    const { value: blob, lines } = await withLogs(() => ext.api.relayGetBlob(
+        'devices/cloud/snapshots/big.zip',
+        { expectedSize: size, onProgress: (done, total) => seen.push([done, total]) },
+    ));
+
+    const got = blob instanceof Blob ? Buffer.from(await blob.arrayBuffer()) : Buffer.alloc(0);
+    if (!(blob instanceof Blob)) bad_('降级后没返回 Blob', String(blob));
+    else if (got.length !== size || !got.equals(body)) {
+        bad_('降级后拿到的数据不对', `${got.length} 字节 ≠ ${size}，或内容不一致`);
+    } else {
+        ok(`中转回 200 时降级成功，仍拿到完整的 ${size} 字节`);
+    }
+
+    if (!lines.join('\n').includes('降级')) {
+        bad_('没在日志里说明降级了', '手机上分不出"慢"是网的问题还是中转没升级');
+    } else {
+        ok('日志里写明了降级回单条流式');
+    }
+
+    // 小文件不该走分片：请求里一个 Range 都不该有
+    const small = makeRangeStub({ size: 4096, chunkSize: 4096 });
+    const smallExt = loadExtension({ fetchImpl: small.impl, seed: configSeed('http://relay.test') });
+    const smallBlob = await smallExt.api.relayGetBlob('devices/cloud/snapshots/small.zip', {
+        expectedSize: 4096, onProgress: () => {},
+    });
+    if (smallBlob.size !== 4096) bad_('小文件下载坏了', String(smallBlob.size));
+    else if (small.state.requests !== 1) bad_('小文件也切了块', `发了 ${small.state.requests} 个请求`);
+    else ok('小文件仍走单条流式（一次请求，不切块）');
 }
 
 /* ---------------------------------------------- 上传绕行：拼 zip + 逐类读 */
@@ -1232,6 +1410,8 @@ async function main() {
     await testRelayTimeoutWording(bad);
     await testDownloadProgress(bad);
     await testDownloadStallKeepsBytes(bad);
+    await testChunkedDownload(bad);
+    await testChunkedFallback(bad);
     await testTimeoutWiring(bad);
     await testDetect(bad);
     await testTavBranch(bad);

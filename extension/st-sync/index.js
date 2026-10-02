@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.1';
+const EXT_VERSION = '2026-10-02.2';
 
 /**
  * 日志也往面板里记一份。
@@ -97,7 +97,39 @@ const TIMEOUT_MS = {
     // 而计时器是"整条链路总共"的预算，不是每一步的。放宽到 5 分钟，状态栏会显示进度，
     // 真卡住了也能从"数值不动"看出来，不用靠超时来兜。
     relayDownload: 300 * 1000,
+    // 分片下载时**每一块**的预算。允许 ≥17 KB/s 的慢块正常跑完（2 MB / 120s），
+    // 只有真正 0 字节卡死的块才会被掐掉、换新连接重试。
+    chunk: 120 * 1000,
 };
+
+/* ------------------------------------------------------------------ *
+ * 分片并行下载
+ *
+ * 起因（2026-10-02 真机 + PC 实测）：中转下行被**按连接限速**，单条连接稳定只有
+ * 35–53 KB/s，80 MB 的包要 25 分钟以上；但 6 条连接并发拉同一个文件，合计能到
+ * 0.5–3.2 MB/s（每条的「实收÷用时」精确等于它报的速度，确认不是截断）。根因不在
+ * 代码也不在带宽，是限速本身 —— 所以把包切块、多连接并发拉就能把总吞吐拉高十几倍。
+ * 服务端那边靠 `Range` 回 206（见 relay/server.js 的 sendFile）。
+ * ------------------------------------------------------------------ */
+const DOWNLOAD_CHUNK_SIZE = 2 * 1024 * 1024;        // 每块 2 MB
+const DOWNLOAD_CONCURRENCY = 6;                     // 并发连接数（实测 6 条合计 3.2 MB/s）
+const DOWNLOAD_CHUNK_RETRIES = 3;                   // 每块最多重试次数（每次换新连接）
+const DOWNLOAD_PARALLEL_MIN_BYTES = 8 * 1024 * 1024; // 小于这个仍走单条流式（省连接开销）
+
+/**
+ * 中转没（升级到）支持 Range 的信号。
+ * 它认不出 Range 头，会把整份当 200 发回来 —— 这时候硬读分片是白费的，上层要降级回单条流式，
+ * 否则中转没升级的那段时间扩展会直接拉不动备份。
+ */
+function rangeUnsupportedError(key) {
+    const err = new Error(`中转不支持 Range（下载 ${key} 时回的是整份 200），需要中转服务升级`);
+    err.rangeUnsupported = true;
+    return err;
+}
+
+function isRangeUnsupported(err) {
+    return !!err && err.rangeUnsupported === true;
+}
 
 /** 超时是我们自己掐断的，跟"网络连不上"是两回事，上层要分开报错 */
 function isAbort(err) {
@@ -521,10 +553,110 @@ async function relayPut(key, body, contentType) {
 }
 
 /**
- * 下载整份备份。走逐块读（res.readBlob）而不是 res.blob()，好把进度报给状态栏；
- * 超时也单独放宽（TIMEOUT_MS.relayDownload），这条路上传的是几十上百 MB。
+ * 拉一个分片。必须是 206；拿到 200 说明中转没升级到支持 Range，抛特定错误触发降级。
+ * 长度对不上也抛 —— 宁可让这一块换新连接重试，也不要把半截数据拼进包里。
+ */
+async function fetchChunk(key, start, end) {
+    const res = await relayFetch(nsPath(null, key), {
+        headers: { Range: `bytes=${start}-${end}` },
+    }, TIMEOUT_MS.chunk);
+
+    if (res.status !== 206) {
+        if (res.status === 200) throw rangeUnsupportedError(key);
+        throw new Error(`下载 ${key} 分片 ${start}-${end} 失败 HTTP ${res.status}`);
+    }
+
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const want = end - start + 1;
+    if (buf.length !== want) {
+        throw new Error(`下载 ${key} 分片 ${start}-${end} 长度不对（期望 ${want}，实际 ${buf.length}）`);
+    }
+    return buf;
+}
+
+/**
+ * 分片并发下载整份文件。
+ *
+ * 工作池：`next` 自增派块，DOWNLOAD_CONCURRENCY 个 worker 并发拉，谁空谁接下一块 ——
+ * 某条连接慢不会拖住别人，块回来也是乱序的，按 seq 放进 slots 最后交给 Blob 拼回来。
+ *
+ * 每块失败就在**本 worker 内**换新连接重试（中转的限速是随机的，同一条连接重试大概率还是慢，
+ * 换一条才有意义）。任一块重试耗尽就整体放弃 —— 和"大小对不上就不恢复"一个态度，
+ * 不拿半截数据去覆盖本机。
+ */
+async function downloadChunked(key, size, { onProgress } = {}) {
+    const count = Math.ceil(size / DOWNLOAD_CHUNK_SIZE);
+    const slots = new Array(count);
+    let received = 0;
+    let next = 0;
+    let abort = null;   // 任一块定死就置上，别的 worker 不再接新块
+
+    const worker = async () => {
+        for (;;) {
+            if (abort) return;
+            const index = next;
+            next += 1;
+            if (index >= count) return;
+
+            const start = index * DOWNLOAD_CHUNK_SIZE;
+            const end = Math.min(start + DOWNLOAD_CHUNK_SIZE, size) - 1;
+
+            let lastErr = null;
+            for (let attempt = 0; attempt <= DOWNLOAD_CHUNK_RETRIES; attempt += 1) {
+                if (attempt > 0) log(`分片 ${index} 第 ${attempt} 次重试（${start}-${end}）`);
+                try {
+                    const buf = await fetchChunk(key, start, end);
+                    slots[index] = buf;
+                    received += buf.length;
+                    if (onProgress) onProgress(received, size);
+                    lastErr = null;
+                    break;
+                } catch (err) {
+                    // 不支持 Range 是"整个中转的事"，不是这一块的错 —— 立刻抛给上层去降级，
+                    // 别在这里把每个分片都白白重试一遍。
+                    if (isRangeUnsupported(err)) throw err;
+                    log(`分片 ${index} 失败（${start}-${end}）`, err);
+                    lastErr = err;
+                }
+            }
+            if (lastErr) {
+                abort = new Error(
+                    `下载分片 ${index} 重试 ${DOWNLOAD_CHUNK_RETRIES} 次仍失败：${lastErr.message}`,
+                );
+                throw abort;
+            }
+        }
+    };
+
+    const workers = [];
+    const n = Math.min(DOWNLOAD_CONCURRENCY, count);
+    for (let i = 0; i < n; i += 1) workers.push(worker());
+    await Promise.all(workers);
+
+    return new Blob(slots);
+}
+
+/**
+ * 下载整份备份。
+ *
+ * 大文件（≥ DOWNLOAD_PARALLEL_MIN_BYTES）走分片并发，绕开中转按连接的下行限速；
+ * 小文件没这个必要，走单条流式（res.readBlob，逐块读好把进度报给状态栏）。
+ * 中转若还没升级到支持 Range，分片路径会抛 rangeUnsupported，这里降级回单条流式 ——
+ * 慢是慢，但不至于直接拉不动。
  */
 async function relayGetBlob(key, { onProgress, expectedSize } = {}) {
+    const size = Number(expectedSize) || 0;
+
+    if (size >= DOWNLOAD_PARALLEL_MIN_BYTES) {
+        try {
+            log(`分片下载：${fmtBytes(size)}，${DOWNLOAD_CONCURRENCY} 连接 × ${fmtBytes(DOWNLOAD_CHUNK_SIZE)}`);
+            return await downloadChunked(key, size, { onProgress });
+        } catch (err) {
+            if (!isRangeUnsupported(err)) throw err;
+            log('降级：改走单条流式下载');
+        }
+    }
+
     const res = await relayFetch(nsPath(null, key), {}, TIMEOUT_MS.relayDownload);
     if (!res.ok) throw new Error(`下载 ${key} 失败 HTTP ${res.status}`);
     return res.readBlob(onProgress, expectedSize);

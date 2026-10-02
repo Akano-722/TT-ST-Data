@@ -28,7 +28,7 @@ function cors(req, res, next) {
     // 用 Bearer 令牌而不是 Cookie，所以 Allow-Origin: * 是安全的。
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,HEAD,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,Range');
     res.setHeader('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     return next();
@@ -92,6 +92,78 @@ function keyPartsOf(req) {
     if (parts.length === 0) throw badRequest('缺少文件路径');
     parts.forEach((part) => assertSegment(part, 'key'));
     return parts;
+}
+
+/* ---------------------------------------------------------------- 文件下发 */
+
+/**
+ * 单段 Range 的解析结果：
+ *   null      —— 没有 Range 头，或者是多段/别的单位，按整份发（我们不产生多段，退化即可）
+ *   'invalid' —— 越界或不合法，该回 416
+ *   {start,end} —— 闭区间，按 206 发这一段
+ */
+function parseRange(header, size) {
+    if (!header) return null;
+    const match = /^bytes=(\d*)-(\d*)$/.exec(String(header).trim());
+    if (!match) return null;
+
+    const [, rawStart, rawEnd] = match;
+    if (rawStart === '' && rawEnd === '') return null;
+
+    let start;
+    let end;
+    if (rawStart === '') {
+        // bytes=-N：末尾 N 字节
+        const suffix = Number(rawEnd);
+        if (!Number.isFinite(suffix) || suffix <= 0) return 'invalid';
+        start = Math.max(0, size - suffix);
+        end = size - 1;
+    } else {
+        start = Number(rawStart);
+        end = rawEnd === '' ? size - 1 : Number(rawEnd);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+        if (end >= size) end = size - 1;
+    }
+
+    // 空文件、起点越界、区间反向，一律算不可满足
+    if (start >= size || end < start) return 'invalid';
+    return { start, end };
+}
+
+/**
+ * 发一份文件，支持单段 Range。
+ *
+ * 为什么要 Range：真机实测中转下行被按连接限速（单条 35–53 KB/s），而多条并发合计能到
+ * 0.5–3.2 MB/s。扩展那边把 zip 切块、多连接并发拉，靠的就是这里能按字节段回包。
+ *
+ * 注意 `createReadStream` 的 end 是**含**的，和 HTTP 的 Content-Range 语义一致，
+ * 不用 ±1；Content-Length 则必须是 end-start+1。
+ */
+async function sendFile(req, res, target) {
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('X-Mtime', String(target.mtime));
+    res.setHeader('Accept-Ranges', 'bytes');
+    // 浏览器端要读得到 Content-Range 才能校验分片，必须显式 expose，否则跨域下是空的
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length,X-Mtime,Content-Range,Accept-Ranges');
+
+    const range = parseRange(req.get('range'), target.size);
+    if (range === 'invalid') {
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${target.size}`);
+        res.end();
+        return;
+    }
+
+    if (!range) {
+        res.setHeader('Content-Length', String(target.size));
+        await pipeline(fs.createReadStream(target.abs), res);
+        return;
+    }
+
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${target.size}`);
+    res.setHeader('Content-Length', String(range.end - range.start + 1));
+    await pipeline(fs.createReadStream(target.abs, { start: range.start, end: range.end }), res);
 }
 
 // ---------------------------------------------------------------- 应用
@@ -161,11 +233,7 @@ app.get('/v1/ns/:ns/:bucket/*', authenticate, requireOwnNamespace, async (req, r
         const target = await storage.stat([req.namespace, req.params.bucket, ...keyParts]);
         if (!target) return res.status(404).json({ error: '文件不存在' });
 
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Length', String(target.size));
-        res.setHeader('X-Mtime', String(target.mtime));
-        res.setHeader('Access-Control-Expose-Headers', 'Content-Length,X-Mtime');
-        await pipeline(fs.createReadStream(target.abs), res);
+        await sendFile(req, res, target);
         return undefined;
     } catch (err) {
         // 下载中途出错时响应头已经发出去了，没法再回 JSON
@@ -286,8 +354,8 @@ app.get('/admin/namespaces/:ns/buckets/:bucket', requireAdmin, async (req, res, 
     }
 });
 
-// 下载。写法和 /v1/ns/:ns/:bucket/* 那条完全一致，只是鉴权换成了管理员令牌——
-// 后台要能直接看 latest.json，光有列表不够。
+// 下载。和 /v1/ns/:ns/:bucket/* 那条一样走 sendFile（都支持 Range），只是鉴权换成了
+// 管理员令牌——后台要能直接看 latest.json，光有列表不够。
 app.get('/admin/namespaces/:ns/buckets/:bucket/files/*', requireAdmin, async (req, res, next) => {
     try {
         assertSegment(req.params.ns, 'namespace');
@@ -295,11 +363,7 @@ app.get('/admin/namespaces/:ns/buckets/:bucket/files/*', requireAdmin, async (re
         const target = await storage.stat([req.params.ns, req.params.bucket, ...keyPartsOf(req)]);
         if (!target) return res.status(404).json({ error: '文件不存在' });
 
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Length', String(target.size));
-        res.setHeader('X-Mtime', String(target.mtime));
-        res.setHeader('Access-Control-Expose-Headers', 'Content-Length,X-Mtime');
-        await pipeline(fs.createReadStream(target.abs), res);
+        await sendFile(req, res, target);
         return undefined;
     } catch (err) {
         if (res.headersSent) return res.destroy();

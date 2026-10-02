@@ -42,13 +42,37 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 
 ## 部署到 Zeabur
 
-1. 新建服务选仓库。**本仓库是 monorepo，Root Directory 必须设成 `relay`**，
-   Zeabur 才会用这里的 `Dockerfile` 构建。
+1. 新建服务选仓库。**分支填 `relay`，Root Directory 留空。**
+   仓库是 monorepo，但 `relay` 分支是把本目录 `git subtree split` 出来的，
+   **根目录就是服务本身**（`Dockerfile`、`package.json`、`server.js` 都在根上）。
+   所以 Root Directory 再填 `relay` 反而会错——那样 Zeabur 会去找 `relay/relay/`，
+   找不到就走自动识别，构建出来的东西不对。
 2. **挂持久卷**：服务页 → Volumes → 挂载目录填 `/data`（和 `DATA_DIR` 一致）。
    ⚠️ 不做这步，容器一重启所有备份全没。挂载时该目录会被清空，首次部署无所谓。
 3. 配环境变量：`ADMIN_TOKEN`、`DATA_DIR=/data`、`BOOTSTRAP_NAMESPACE=A`。
 4. 部署完成看**日志**：首次启动会打印命名空间 `A` 的访问令牌。
    **只打印这一次**，立刻复制保存。
+
+## 更新已部署的中转
+
+Zeabur 拉的是 **`relay` 分支**，不是 `main`。所以在本目录改完代码后**光推 `main` 不会生效**，
+必须重新切一次子树分支推上去：
+
+```bash
+# 在仓库根目录跑
+git add relay
+git commit -m "中转：xxx"
+
+git branch -D relay
+git subtree split --prefix=relay -b relay
+git push origin relay
+```
+
+推完 Zeabur 会自动重新部署。**只改扩展（`extension/st-sync/`）就不用走这套**，
+中转那边没变，不需要重新部署。
+
+> 和扩展的 `extension` 分支同理：`git subtree split` 是确定性的，只要 `main` 的历史是只追加的，
+> 推上去就是快进。如果 rebase / amend 过已推的 `main`，推 `relay` 就会变成非快进，得加 `--force`。
 
 ## 接口
 

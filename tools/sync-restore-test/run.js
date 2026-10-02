@@ -769,25 +769,51 @@ async function testDetect(bad_) {
  *
  * @param {number} o.size        文件总字节
  * @param {boolean} o.ignoreRange true → 当"中转没升级"，无视 Range 回整份 200
- * @param {number} o.failChunk   这一块第一次请求返回 500（验换新连接重试）
+ * @param {number} o.failChunk   这一块的前 failTimes 次请求返回 500（验换新连接重试）
+ * @param {number} o.failTimes   默认 1：只第一次失败
+ * @param {number|Function} o.delayMs 每块的延迟（可给 index 的函数），用来控制谁先跑完
  */
-function makeRangeStub({ size, ignoreRange = false, failChunk = -1, chunkSize }) {
+function makeRangeStub({
+    size, ignoreRange = false, failChunk = -1, chunkSize, failTimes = 1, delayMs = 15, dangling = false,
+}) {
     const body = Buffer.alloc(size);
     for (let i = 0; i < size; i += 1) body[i] = i & 0xff;
 
-    const state = { inFlight: 0, maxInFlight: 0, requests: 0, attempts: new Map(), ok: 0 };
+    const state = {
+        inFlight: 0, maxInFlight: 0, requests: 0, attempts: new Map(),
+        ok: 0, aborted: 0, dangling: 0, cancelled: 0,
+    };
+    const delayOf = (index) => (typeof delayMs === 'function' ? delayMs(index) : delayMs);
 
     const impl = async (url, opts) => {
         state.inFlight += 1;
         state.requests += 1;
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
-        try {
-            // 一点延迟，保证并发请求真的会重叠，maxInFlight 才有意义
-            await new Promise((r) => setTimeout(r, 15));
 
+        // 盯着调用方的 abort 信号：被掐断的请求不算"跑完"，也单独记一笔 ——
+        // "整批拉闸有没有真的把在途请求掐掉"只能从这里验出来
+        // （桩自己的定时器不会因为 fetch 被 abort 就停，所以不能拿 ok 计数当证据）。
+        const ac = opts && opts.signal;
+        if (ac) {
+            if (ac.aborted) state.aborted += 1;
+            else ac.addEventListener('abort', () => { state.aborted += 1; }, { once: true });
+        }
+
+        try {
             const headers = (opts && opts.headers) || {};
             const range = headers.Range || headers.range;
             if (ignoreRange || !range) {
+                // 一点延迟，保证并发请求真的会重叠，maxInFlight 才有意义
+                await new Promise((r) => setTimeout(r, delayOf(-1)));
+                if (ignoreRange && range && dangling) {
+                    // 「带着 Range 却被当整份回」：体故意不结束，模拟那份几十 MB 的完整响应。
+                    // 客户端不主动取消它就会一直悬着 —— 每一条都占着一根连接不放。
+                    state.dangling += 1;
+                    return new Response(new ReadableStream({
+                        start(controller) { controller.enqueue(body); },
+                        cancel() { state.cancelled += 1; },
+                    }), { status: 200, headers: { 'Content-Type': 'application/zip' } });
+                }
                 return new Response(body, { status: 200, headers: { 'Content-Type': 'application/zip' } });
             }
 
@@ -795,13 +821,15 @@ function makeRangeStub({ size, ignoreRange = false, failChunk = -1, chunkSize })
             if (!match) throw new Error(`桩收到了不认识的 Range：${range}`);
             const start = Number(match[1]);
             const end = Number(match[2]);
-
             const index = Math.floor(start / chunkSize);
+
+            await new Promise((r) => setTimeout(r, delayOf(index)));
+
             const n = (state.attempts.get(index) || 0) + 1;
             state.attempts.set(index, n);
-            if (index === failChunk && n === 1) return new Response('boom', { status: 500 });
+            if (index === failChunk && n <= failTimes) return new Response('boom', { status: 500 });
 
-            state.ok += 1;
+            if (!ac || !ac.aborted) state.ok += 1;
             return new Response(body.subarray(start, end + 1), {
                 status: 206,
                 headers: {
@@ -894,7 +922,11 @@ async function testChunkedFallback(bad_) {
     const { api } = loadExtension({ fetchImpl: async () => json({}), seed: configSeed('http://relay.test') });
     const size = api.DOWNLOAD_PARALLEL_MIN_BYTES;   // 刚好踩到并行阈值
 
-    const { impl, body } = makeRangeStub({ size, ignoreRange: true, chunkSize: api.DOWNLOAD_CHUNK_SIZE });
+    // dangling: 把"带 Range 却回整份 200"的响应体做成永远不结束的 —— 只有客户端主动取消，
+    // 那根连接才会松开。不取消的话，真机上就是 6 根连接被占死、后面全部超时。
+    const { impl, state, body } = makeRangeStub({
+        size, ignoreRange: true, chunkSize: api.DOWNLOAD_CHUNK_SIZE, dangling: true,
+    });
     const ext = loadExtension({ fetchImpl: impl, seed: configSeed('http://relay.test') });
 
     const seen = [];
@@ -917,6 +949,17 @@ async function testChunkedFallback(bad_) {
         ok('日志里写明了降级回单条流式');
     }
 
+    // 这条是真机事故的核心：拿到不要的 200 之后必须把体取消掉，否则连接被占死
+    if (!state.dangling) {
+        bad_('桩没造出"带 Range 回 200"的响应', '这条用例没验到该验的东西');
+    } else if (state.cancelled !== state.dangling) {
+        bad_('不要的 200 响应体没被取消',
+            `${state.dangling} 份里只取消了 ${state.cancelled} 份 —— 剩下的会一直占着连接，`
+            + '后面的请求全得排队（真机上就是"进度 0、每条都超时"）');
+    } else {
+        ok(`不要的 200 响应体全部被取消（${state.cancelled}/${state.dangling}），连接会松开`);
+    }
+
     // 小文件不该走分片：请求里一个 Range 都不该有
     const small = makeRangeStub({ size: 4096, chunkSize: 4096 });
     const smallExt = loadExtension({ fetchImpl: small.impl, seed: configSeed('http://relay.test') });
@@ -926,6 +969,79 @@ async function testChunkedFallback(bad_) {
     if (smallBlob.size !== 4096) bad_('小文件下载坏了', String(smallBlob.size));
     else if (small.state.requests !== 1) bad_('小文件也切了块', `发了 ${small.state.requests} 个请求`);
     else ok('小文件仍走单条流式（一次请求，不切块）');
+}
+
+/**
+ * 一块反复失败 → 整批拉闸，在途的分片必须被掐断。
+ *
+ * 这是真机事故逼出来的：中转还没升级时分片拿到的 200 响应体没人取消，6 个 80 MB 的
+ * 僵尸下载把同源那几条连接全占死，之后**任何**请求都只能排队 —— 现象是"进度一直 0、
+ * 每条都 120 秒超时"，跟服务器挂了长得一模一样。所以失败时必须主动收场。
+ */
+async function testChunkedFailureAbortsSiblings(bad_) {
+    console.log('\n── 分片失败：整批拉闸，不留下在途请求 ──');
+
+    const { api } = loadExtension({ fetchImpl: async () => json({}), seed: configSeed('http://relay.test') });
+    const CHUNK = api.DOWNLOAD_CHUNK_SIZE;
+    const CONC = api.DOWNLOAD_CONCURRENCY;
+    const RETRIES = api.DOWNLOAD_CHUNK_RETRIES;
+    const size = CHUNK * (CONC + 3);
+    const failChunk = 2;
+
+    // 坏块秒回 500（好让它快速耗尽重试）；好块故意慢，保证拉闸时它们还在途，
+    // 这样"有没有被掐断"才验得出来。
+    const { impl, state } = makeRangeStub({
+        size, failChunk, failTimes: 99, chunkSize: CHUNK,
+        delayMs: (index) => (index === failChunk ? 5 : 400),
+    });
+    const ext = loadExtension({ fetchImpl: impl, seed: configSeed('http://relay.test') });
+
+    let err = null;
+    let requestsAtFailure = 0;
+    try {
+        await ext.api.relayGetBlob('devices/cloud/snapshots/big.zip', {
+            expectedSize: size, onProgress: () => {},
+        });
+    } catch (e) {
+        err = e;
+        requestsAtFailure = state.requests;
+    }
+
+    if (!err) {
+        bad_('一块反复失败却没报错', '会拿缺块的数据去拼出一个坏包');
+    } else if (!err.message.includes('重试 3 次仍失败')) {
+        bad_('报错没写清重试了几次', err.message);
+    } else if (!err.message.includes(`字节 ${failChunk * CHUNK}`)) {
+        bad_('报错没带上字节区间，手机上定位不到是哪块', err.message);
+    } else {
+        ok(`按预期失败，且说清了是哪一块：${err.message.slice(0, 70)}…`);
+    }
+
+    if ((state.attempts.get(failChunk) || 0) !== RETRIES + 1) {
+        bad_('坏块重试次数不对', `试了 ${state.attempts.get(failChunk) || 0} 次（期望 ${RETRIES + 1}）`);
+    } else {
+        ok(`坏块试满 1 次 + ${RETRIES} 次重试才放弃`);
+    }
+
+    // 别的分片只该发过一次请求：失败一确定，它们就该被掐断，而不是接着拉完
+    const others = [...state.attempts.keys()].filter((k) => k !== failChunk);
+    const retriedOthers = others.filter((k) => state.attempts.get(k) > 1);
+    if (retriedOthers.length) {
+        bad_('坏块之外的分片还在继续跑', `分片 ${retriedOthers} 有重试，说明整批没拉闸`);
+    } else if (state.aborted !== CONC - 1) {
+        bad_('坏块定死之后在途分片没被掐断',
+            `只 abort 了 ${state.aborted} 条（期望 ${CONC - 1}）；没掐掉的会接着把字节拉完，白占连接`);
+    } else {
+        ok(`拉闸及时：在途的 ${state.aborted} 条分片请求全被 abort，不再往下拉`);
+    }
+
+    // 拉闸之后不该再有新请求冒出来（在途的也被 abort 了）
+    await new Promise((r) => setTimeout(r, 700));
+    if (state.requests !== requestsAtFailure) {
+        bad_('拉闸后还有请求在途或新发', `${requestsAtFailure} → ${state.requests}；这些连接会被白占`);
+    } else {
+        ok(`失败即收场，请求数停在 ${requestsAtFailure}（= ${CONC} 条首发 + ${RETRIES} 次坏块重试）`);
+    }
 }
 
 /* ---------------------------------------------- 上传绕行：拼 zip + 逐类读 */
@@ -1412,6 +1528,7 @@ async function main() {
     await testDownloadStallKeepsBytes(bad);
     await testChunkedDownload(bad);
     await testChunkedFallback(bad);
+    await testChunkedFailureAbortsSiblings(bad);
     await testTimeoutWiring(bad);
     await testDetect(bad);
     await testTavBranch(bad);

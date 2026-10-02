@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.2';
+const EXT_VERSION = '2026-10-02.3';
 
 /**
  * 日志也往面板里记一份。
@@ -162,9 +162,18 @@ function timeoutError(what, timeoutMs, received = 0) {
  *
  * 每步都记一行日志，状态栏也会实时显示"卡在哪一步、已经多久"，手机上不用开控制台就能看。
  */
-async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what = '请求' } = {}) {
+async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what = '请求', signal = null } = {}) {
     const controller = new AbortController();
     const started = Date.now();
+
+    // 外部还可能挂着一条"整批作废"的信号（分片下载里任一块定死就拉闸），并到本地超时一起掐。
+    // 少了这一步，一块失败之后别的分片还会自顾自把几十 MB 拉完，白占着连接 ——
+    // 而浏览器的同源连接数是有限的（HTTP/1.1 只有 6 条），占满了后面所有请求都只能排队。
+    const onExternalAbort = () => controller.abort();
+    if (signal) {
+        if (signal.aborted) controller.abort();
+        else signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
 
     // 状态栏跟着走：卡住时至少能看出是卡在哪一步、卡了多久
     STATE.step = what;
@@ -172,12 +181,18 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
 
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+    /** 计时器（和那条外部信号的监听）留到 body 读完才收，不能拿到响应头就清 */
+    const cleanup = () => {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onExternalAbort);
+    };
+
     let res;
     try {
         log(`${what} 发出（超时 ${timeoutMs / 1000}s）：${url}`);
         res = await fetch(url, { ...options, signal: controller.signal });
     } catch (err) {
-        clearTimeout(timer);
+        cleanup();
         if (isAbort(err)) {
             log(`${what} 超时，用时 ${Date.now() - started}ms`);
             throw timeoutError(what, timeoutMs);
@@ -203,10 +218,20 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
                 log(`${what} 读 body 失败`, err);
                 throw err;
             } finally {
-                clearTimeout(timer);
+                cleanup();
             }
         };
     }
+
+    /**
+     * "这份响应我不要了"。
+     *
+     * 光 cancel body 还不够：超时计时器和那条外部 abort 监听还挂在身上，得一并收掉。
+     * 拿到非预期状态码（比如分片时撞上整份 200）就属于这种，不收的话每块都会漏一个 ——
+     * 几十块下来监听器堆一起、计时器空转，连"谁真被 abort 了"都数不准。
+     * 和 res.readBlob 一样，都是挂在这个响应对象上的内部约定。
+     */
+    res.dispose = cleanup;
 
     /**
      * 逐块读版。给大文件下载用：`res.blob()` 是一次性的，中途拿不到任何反馈，
@@ -245,7 +270,7 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
             log(`${what} 读 body 失败（已收 ${received} 字节）`, err);
             throw err;
         } finally {
-            clearTimeout(timer);
+            cleanup();
         }
     };
 
@@ -516,13 +541,16 @@ function nsPath(bucket, key) {
 
 async function relayFetch(pathname, options = {}, timeoutMs = TIMEOUT_MS.relay) {
     const s = requireConfig();
-    const headers = { ...(options.headers || {}) };
+    // what / signal 是我们自己用的，不能混进 fetch 的 init 里
+    const { what: label, signal, ...rest } = options;
+    const headers = { ...(rest.headers || {}) };
     headers.Authorization = `Bearer ${s.token}`;
     const base = String(s.relayUrl).replace(/\/+$/, '');
     try {
-        return await timedFetch(base + pathname, { ...options, headers }, {
+        return await timedFetch(base + pathname, { ...rest, headers }, {
             timeoutMs,
-            what: `中转 ${options.method || 'GET'} ${pathname}`,
+            what: label || `中转 ${rest.method || 'GET'} ${pathname}`,
+            signal,
         });
     } catch (err) {
         // 超时已经说清楚了是超时，别再包成"连不上"
@@ -556,12 +584,21 @@ async function relayPut(key, body, contentType) {
  * 拉一个分片。必须是 206；拿到 200 说明中转没升级到支持 Range，抛特定错误触发降级。
  * 长度对不上也抛 —— 宁可让这一块换新连接重试，也不要把半截数据拼进包里。
  */
-async function fetchChunk(key, start, end) {
+async function fetchChunk(key, start, end, signal) {
     const res = await relayFetch(nsPath(null, key), {
         headers: { Range: `bytes=${start}-${end}` },
+        what: `中转分片 ${start}-${end}（${fmtBytes(end - start + 1)}）`,
+        signal,
     }, TIMEOUT_MS.chunk);
 
     if (res.status !== 206) {
+        // 关键：不想要这份响应体就必须**主动取消**它。否则浏览器会把整份（中转没升级时
+        // 就是几十上百 MB）继续拉完，白白霸占一条连接 —— 同源连接数就那么几条，
+        // 占满了后面所有请求都只能排队，表现就是"什么都没发生、进度一直 0"。
+        try {
+            await res.body?.cancel();
+        } catch { /* 已经断了就算了 */ }
+        res.dispose?.();
         if (res.status === 200) throw rangeUnsupportedError(key);
         throw new Error(`下载 ${key} 分片 ${start}-${end} 失败 HTTP ${res.status}`);
     }
@@ -587,13 +624,18 @@ async function fetchChunk(key, start, end) {
 async function downloadChunked(key, size, { onProgress } = {}) {
     const count = Math.ceil(size / DOWNLOAD_CHUNK_SIZE);
     const slots = new Array(count);
+    // 一条"整批作废"的信号：任一块定死就掐掉其余在途的分片。不掐的话它们会继续把
+    // 几十 MB 拉完 —— 这些字节我们注定用不上，却会把同源那几条连接全占住。
+    const controller = new AbortController();
     let received = 0;
     let next = 0;
-    let abort = null;   // 任一块定死就置上，别的 worker 不再接新块
+    let failure = null;   // 第一个"真失败"，最后抛它（不是被连带掐断的那些）
 
+    // worker 一律不抛：失败只记进 failure 并拉闸，免得 Promise.all 抢着 reject、
+    // 把真正的失败原因冲掉。
     const worker = async () => {
         for (;;) {
-            if (abort) return;
+            if (failure) return;
             const index = next;
             next += 1;
             if (index >= count) return;
@@ -605,33 +647,39 @@ async function downloadChunked(key, size, { onProgress } = {}) {
             for (let attempt = 0; attempt <= DOWNLOAD_CHUNK_RETRIES; attempt += 1) {
                 if (attempt > 0) log(`分片 ${index} 第 ${attempt} 次重试（${start}-${end}）`);
                 try {
-                    const buf = await fetchChunk(key, start, end);
+                    const buf = await fetchChunk(key, start, end, controller.signal);
                     slots[index] = buf;
                     received += buf.length;
                     if (onProgress) onProgress(received, size);
                     lastErr = null;
                     break;
                 } catch (err) {
+                    // 整批已经拉闸了，这条是被连带掐断的，不用报也不用重试
+                    if (failure) return;
                     // 不支持 Range 是"整个中转的事"，不是这一块的错 —— 立刻抛给上层去降级，
                     // 别在这里把每个分片都白白重试一遍。
-                    if (isRangeUnsupported(err)) throw err;
+                    if (isRangeUnsupported(err)) {
+                        failure = err;
+                        controller.abort();
+                        return;
+                    }
                     log(`分片 ${index} 失败（${start}-${end}）`, err);
                     lastErr = err;
                 }
             }
             if (lastErr) {
-                abort = new Error(
-                    `下载分片 ${index} 重试 ${DOWNLOAD_CHUNK_RETRIES} 次仍失败：${lastErr.message}`,
+                failure = new Error(
+                    `下载分片 ${index}（字节 ${start}-${end}）重试 ${DOWNLOAD_CHUNK_RETRIES} 次仍失败：${lastErr.message}`,
                 );
-                throw abort;
+                controller.abort();
+                return;
             }
         }
     };
 
-    const workers = [];
     const n = Math.min(DOWNLOAD_CONCURRENCY, count);
-    for (let i = 0; i < n; i += 1) workers.push(worker());
-    await Promise.all(workers);
+    await Promise.all(Array.from({ length: n }, () => worker()));
+    if (failure) throw failure;
 
     return new Blob(slots);
 }

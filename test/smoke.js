@@ -168,6 +168,72 @@ async function main() {
         assert(buf.equals(payload), '下载内容与上传不一致');
     });
 
+    console.log('\nRange（分片下载）:');
+    await check('无 Range 时仍回整份 200（回归）', async () => {
+        const res = await fetch(`${BASE}/v1/ns/A/tavern/notes/hello.txt`, {
+            headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        assertEqual(res.status, 200, '状态码');
+        assertEqual(res.headers.get('accept-ranges'), 'bytes', 'Accept-Ranges');
+        assert(!res.headers.get('content-range'), '整份响应不该带 Content-Range');
+        assert(Buffer.from(await res.arrayBuffer()).equals(payload), '内容');
+    });
+
+    await check('Range: bytes=0-4 → 206 + 前 5 字节', async () => {
+        const res = await fetch(`${BASE}/v1/ns/A/tavern/notes/hello.txt`, {
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), Range: 'bytes=0-4' },
+        });
+        assertEqual(res.status, 206, '状态码');
+        assertEqual(res.headers.get('content-range'), `bytes 0-4/${payload.length}`, 'Content-Range');
+        assertEqual(res.headers.get('content-length'), '5', 'Content-Length');
+        assert(Buffer.from(await res.arrayBuffer()).equals(payload.subarray(0, 5)), '内容应为前 5 字节');
+    });
+
+    await check('Range: bytes=<size-3>- → 末尾 3 字节', async () => {
+        const from = payload.length - 3;
+        const res = await fetch(`${BASE}/v1/ns/A/tavern/notes/hello.txt`, {
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), Range: `bytes=${from}-` },
+        });
+        assertEqual(res.status, 206, '状态码');
+        assertEqual(res.headers.get('content-range'), `bytes ${from}-${payload.length - 1}/${payload.length}`, 'Content-Range');
+        assert(Buffer.from(await res.arrayBuffer()).equals(payload.subarray(from)), '内容应为末尾 3 字节');
+    });
+
+    await check('Range: bytes=-2（后缀）→ 最后 2 字节', async () => {
+        const res = await fetch(`${BASE}/v1/ns/A/tavern/notes/hello.txt`, {
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), Range: 'bytes=-2' },
+        });
+        assertEqual(res.status, 206, '状态码');
+        assertEqual(res.headers.get('content-range'), `bytes ${payload.length - 2}-${payload.length - 1}/${payload.length}`, 'Content-Range');
+        assert(Buffer.from(await res.arrayBuffer()).equals(payload.subarray(-2)), '内容应为最后 2 字节');
+    });
+
+    await check('Range 超出末端会被夹到文件尾', async () => {
+        const from = payload.length - 2;
+        const res = await fetch(`${BASE}/v1/ns/A/tavern/notes/hello.txt`, {
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), Range: `bytes=${from}-99999` },
+        });
+        assertEqual(res.status, 206, '状态码');
+        assertEqual(res.headers.get('content-range'), `bytes ${from}-${payload.length - 1}/${payload.length}`, 'Content-Range');
+        assert(Buffer.from(await res.arrayBuffer()).equals(payload.subarray(from)), '内容');
+    });
+
+    await check('非法 Range: bytes=999999- → 416 + Content-Range: bytes */size', async () => {
+        const res = await fetch(`${BASE}/v1/ns/A/tavern/notes/hello.txt`, {
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), Range: 'bytes=999999-' },
+        });
+        assertEqual(res.status, 416, '状态码');
+        assertEqual(res.headers.get('content-range'), `bytes */${payload.length}`, 'Content-Range');
+    });
+
+    await check('管理下载接口同样支持 Range', async () => {
+        const res = await fetch(`${BASE}/admin/namespaces/A/buckets/tavern/files/notes/hello.txt`, {
+            headers: { ...authHeaders(ADMIN_TOKEN), Range: 'bytes=1-3' },
+        });
+        assertEqual(res.status, 206, '状态码');
+        assert(Buffer.from(await res.arrayBuffer()).equals(payload.subarray(1, 4)), '内容应为第 2-4 字节');
+    });
+
     await check('GET 不存在的文件返回 404', async () => {
         const res = await fetch(`${BASE}/v1/ns/A/tavern/nope.txt`, {
             headers: authHeaders(BOOTSTRAP_TOKEN),

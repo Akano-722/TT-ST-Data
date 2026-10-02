@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.8';
+const EXT_VERSION = '2026-10-02.9';
 
 /**
  * 日志也往面板里记一份。
@@ -2444,6 +2444,20 @@ function ttTauriInvoke() {
     return core.invoke;
 }
 
+/**
+ * ⚠️ 参数名有两套规矩，混在一条链路上，**别统一**（2026-10-02 真机踩过）：
+ *
+ *  - **命令参数的顶层键要 camelCase**。Tauri v2 默认给命令参数加了 `rename_all = "camelCase"`，
+ *    传 `file_path` 会被回一句
+ *    ``invalid args `filePath` for command `stage_upload_finish`: missing required key filePath``。
+ *    所以 finish/discard 用的是 `filePath` / `expectedSize`。
+ *  - **begin 的 `dto` 里面那些字段要保持 snake_case**（`preferred_extension`）——
+ *    它们是 serde 结构体 `StageUploadBeginDto` 的字段，走的是 serde 的名字，不归 Tauri 的参数转换管。
+ *
+ * 酒馆自己的 upload-service.js 之所以两种都写 snake_case，是因为它走的是 `safeInvoke`
+ * （TT 自己那层会把顶层键转成 camelCase）。我们用裸 invoke，就得自己写对。
+ */
+
 function isAndroidWebView() {
     return /android/i.test((navigator && navigator.userAgent) || '');
 }
@@ -2514,7 +2528,7 @@ async function ttStageArchive(blob, fileName, onProgress) {
 
     const discard = async () => {
         try {
-            await ipcWithTimeout(invoke('stage_upload_discard', { file_path: filePath }), '酒馆暂存（清理）');
+            await ipcWithTimeout(invoke('stage_upload_discard', { filePath }), '酒馆暂存（清理）');
             log('暂存文件已清理');
         } catch (err) {
             // 删不掉不影响这次导入（包已经落盘了），只是 App 缓存里多留一份
@@ -2548,8 +2562,8 @@ async function ttStageArchive(blob, fileName, onProgress) {
         }
 
         await ipcWithTimeout(invoke('stage_upload_finish', {
-            file_path: filePath,
-            expected_size: blob.size,
+            filePath,
+            expectedSize: blob.size,
         }), '酒馆暂存（收尾）');
 
         return { filePath, discard };

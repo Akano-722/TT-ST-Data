@@ -785,6 +785,25 @@ async function testImportSubmitFailure(bad_) {
 }
 
 /**
+ * 照真实 Tauri 的规矩卡参数名：**命令参数的顶层键是 camelCase**。
+ *
+ * 桩必须这么做，否则测过了真机照样炸 —— 2026-10-02 就是这么炸的：
+ *   扩展传了 `file_path`，真机回
+ *   ``invalid args `filePath` for command `stage_upload_finish`: command stage_upload_finish
+ *     missing required key filePath``
+ * 而桩当时只读 `args.file_path`，两边一起错，测试全绿。
+ * 注意**只有顶层键**是 camelCase：begin 的 `dto` 里面是 serde 字段，仍然 snake_case。
+ */
+function requireCommandKey(args, key, command) {
+    if (!args || typeof args !== 'object' || !(key in args)) {
+        throw new Error(
+            `invalid args \`${key}\` for command \`${command}\`: `
+            + `command ${command} missing required key ${key}`,
+        );
+    }
+}
+
+/**
  * 移动端：酒馆不给网页直接交包，得自己暂存成文件再走 archive_path。
  *
  * 钉的是 2026-10-02 真机那次 400：
@@ -802,9 +821,7 @@ async function testTtMobileImportBypass(bad_) {
 
     const tauriInvoke = async (command, args, options) => {
         if (command === 'stage_upload_begin') {
-            staged.beginKind = args.dto.kind;
-            staged.beginSize = args.dto.size;
-            staged.beginExtension = args.dto.preferred_extension;
+            staged.beginDto = args.dto;
             staged.path = '/fake-staging/generic/abc.zip';
             return { file_path: staged.path, chunk_size: CHUNK };
         }
@@ -818,10 +835,13 @@ async function testTtMobileImportBypass(bad_) {
             return Number(headers.offset) + (args instanceof Uint8Array ? args.length : 0);
         }
         if (command === 'stage_upload_finish') {
-            staged.finished = { path: args.file_path, size: args.expected_size };
-            return { file_path: args.file_path, size: args.expected_size };
+            requireCommandKey(args, 'filePath', command);
+            requireCommandKey(args, 'expectedSize', command);
+            staged.finished = { path: args.filePath, size: args.expectedSize };
+            return { file_path: args.filePath, size: args.expectedSize };
         }
         if (command === 'stage_upload_discard') {
+            requireCommandKey(args, 'filePath', command);
             staged.discarded += 1;
             return null;
         }
@@ -840,18 +860,32 @@ async function testTtMobileImportBypass(bad_) {
         seed: configSeed('http://relay.test'),
     });
 
-    const report = await api.restoreViaNativeImport(new Blob([archive]), 'backup.zip');
+    // 出错也要收住：直接抛出去会把后面所有用例一起带走，回归就只剩"脚本自己出错"这一句
+    let report = null;
+    let err = null;
+    try {
+        report = await api.restoreViaNativeImport(new Blob([archive]), 'backup.zip');
+    } catch (e) {
+        err = e;
+    }
+    if (err) {
+        bad('绕行整条路走失败了', err.message);
+        return;
+    }
 
     if (seen.uploadAttempts !== 1) bad('没先试 FormData 那条正路', `试了 ${seen.uploadAttempts} 次`);
     else ok('先走正路（FormData），被拒了才绕行');
 
-    if (!staged.beginKind) bad('压根没调 stage_upload_begin', '绕行没生效');
-    else if (staged.beginKind === 'data-archive') {
+    const dto = staged.beginDto || {};
+    if (!staged.beginDto) bad('压根没调 stage_upload_begin', '绕行没生效');
+    else if (dto.kind === 'data-archive') {
         bad('暂存用了 data-archive 这个 kind', '那正是酒馆在移动端点名拦掉的名字，必然失败');
-    } else ok(`暂存用的 kind 是 ${staged.beginKind}（不是被拦的 data-archive）`);
+    } else ok(`暂存用的 kind 是 ${dto.kind}（不是被拦的 data-archive）`);
 
-    if (staged.beginExtension !== 'zip') bad('暂存没带上扩展名 zip', String(staged.beginExtension));
-    if (staged.beginSize !== archive.length) bad('暂存没报对包大小', `${staged.beginSize} != ${archive.length}`);
+    // dto 里是 serde 字段，**必须**保持 snake_case —— 写成 preferredExtension 真机会收不到
+    if (!('preferred_extension' in dto)) bad('dto 里的扩展名键名不对', JSON.stringify(dto));
+    else if (dto.preferred_extension !== 'zip') bad('暂存没带上扩展名 zip', String(dto.preferred_extension));
+    if (dto.size !== archive.length) bad('暂存没报对包大小', `${dto.size} != ${archive.length}`);
 
     if (staged.chunks.some((c) => !c.bytes)) bad('iOS 上没走裸二进制分片', 'iOS 该传 Uint8Array，base64 是 Android 那条');
     else {

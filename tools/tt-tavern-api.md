@@ -111,6 +111,15 @@ iOS/Android 上提交 FormData **一定失败**，回 400：
 
 细节与坑：
 
+- ⚠️ **参数名两套规矩，混在一条链路上**（2026-10-02 真机第一次跑就炸在这）：
+  **命令参数的顶层键是 camelCase** —— Tauri v2 默认给命令参数加了 `rename_all = "camelCase"`，
+  传 `file_path` 会被回
+  ``invalid args `filePath` for command `stage_upload_finish`: missing required key filePath``。
+  所以 finish/discard 要写 `filePath` / `expectedSize`。
+  但 **`stage_upload_begin` 的 `dto` 里面保持 snake_case**（`preferred_extension`）——
+  那是 serde 结构体 `StageUploadBeginDto` 的字段，不归 Tauri 的参数转换管。
+  酒馆自己的 `upload-service.js` 两种都写 snake_case，是因为它走的是 `safeInvoke`
+  （TT 自己那层会转顶层键）；用**裸** `invoke` 就得自己写对。
 - `window.__TAURI__` 是可用的（`tauri.conf.json` 里 `withGlobalTauri: true`），
   调用形状照抄 `upload-service.js`：`invoke(cmd, args, { headers })`。
   `stage_upload_chunk` 的**裸二进制只给 iOS**；Android 那边 Tauri 收不下，要传

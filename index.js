@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.4';
+const EXT_VERSION = '2026-10-02.5';
 
 /**
  * 日志也往面板里记一份。

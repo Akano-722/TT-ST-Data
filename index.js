@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-01.4';
+const EXT_VERSION = '2026-10-02.1';
 
 /**
  * 日志也往面板里记一份。
@@ -93,6 +93,10 @@ const TIMEOUT_MS = {
     st: 60 * 1000,
     // 服务端要先把自己几百 MB 的数据打包成 zip 才开始回包，比普通请求慢得多
     backup: 180 * 1000,
+    // 从中转拉整份备份：手机上 80 MB 的包在 60s 里传不完（2026-10-02 真机实测），
+    // 而计时器是"整条链路总共"的预算，不是每一步的。放宽到 5 分钟，状态栏会显示进度，
+    // 真卡住了也能从"数值不动"看出来，不用靠超时来兜。
+    relayDownload: 300 * 1000,
 };
 
 /** 超时是我们自己掐断的，跟"网络连不上"是两回事，上层要分开报错 */
@@ -100,11 +104,17 @@ function isAbort(err) {
     return !!err && (err.name === 'AbortError' || err.code === 20);
 }
 
-function timeoutError(what, timeoutMs) {
+/**
+ * received > 0 时文案换一种说法：已经收到过字节了，说"没有响应"是误导 ——
+ * 它明明响应了、只是半路停住。手机上只能看这一行，得能分出"卡住"和"慢"。
+ */
+function timeoutError(what, timeoutMs, received = 0) {
     const seconds = timeoutMs / 1000;
     // 不取整：测试里挂的是几百毫秒，取整会变成"0 秒没有响应"
     const shown = Number.isInteger(seconds) ? seconds : seconds.toFixed(1);
-    const err = new Error(`${what} 超时：${shown} 秒没有响应，已中断`);
+    const err = new Error(received
+        ? `${what} 超时：${shown} 秒没有新数据，已收 ${fmtBytes(received)}，已中断`
+        : `${what} 超时：${shown} 秒没有响应，已中断`);
     err.isTimeout = true;
     return err;
 }
@@ -165,6 +175,48 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
             }
         };
     }
+
+    /**
+     * 逐块读版。给大文件下载用：`res.blob()` 是一次性的，中途拿不到任何反馈，
+     * 手机上只能干等——分不出"在慢慢爬"和"卡死了"。
+     *
+     * 计时器语义不变（还是整条链路的总预算），只是每收到一块就调一次 onProgress，
+     * 让状态栏能显示进度。total 优先用调用方给的（它知道该多大），
+     * 否则退回响应头里的 Content-Length；都没有就是 0，界面只显示已下载字节。
+     */
+    res.readBlob = async (onProgress, expectedSize) => {
+        if (!res.body || typeof res.body.getReader !== 'function') return res.blob();
+
+        const total = Number(expectedSize)
+            || Number(res.headers.get('Content-Length'))
+            || 0;
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!value || !value.length) continue;
+                chunks.push(value);
+                received += value.length;
+                if (onProgress) onProgress(received, total);
+            }
+            log(`${what} body 读完，总共 ${Date.now() - started}ms，${received} 字节`);
+            return new Blob(chunks);
+        } catch (err) {
+            if (isAbort(err)) {
+                log(`${what} 读 body 超时（已收 ${received} 字节），已中断`);
+                throw timeoutError(what, timeoutMs, received);
+            }
+            log(`${what} 读 body 失败（已收 ${received} 字节）`, err);
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+
     return res;
 }
 
@@ -237,6 +289,7 @@ const STATE = {
     lastOk: null,
     suppressDirty: false, // 恢复数据期间挂起改动检测，避免把恢复本身误判成用户改动
     restore: null,        // 恢复进行中时是 { label, done, total }，用来在状态栏显示进度
+    download: null,       // 从中转下载备份时是 { label, done, total }（字节），同上
 };
 
 let ui = {};
@@ -355,11 +408,22 @@ function endBusy() {
     STATE.busy = false;
     STATE.busySince = 0;
     STATE.step = '';
+    // 进度条属于"这一轮"的，收工时必须清掉，否则下一轮一进来就顶着上一次的数字
+    STATE.download = null;
     if (STATE.ticker) {
         clearInterval(STATE.ticker);
         STATE.ticker = null;
     }
     renderStatus();
+}
+
+/** 给字节数配个单位。total 未知时传 0，调用方自己决定怎么显示 */
+function fmtBytes(bytes) {
+    const n = Number(bytes);
+    if (!Number.isFinite(n) || n < 0) return '?';
+    if (n < 1024) return `${n} B`;
+    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1048576).toFixed(1)} MB`;
 }
 
 function renderStatus() {
@@ -368,6 +432,15 @@ function renderStatus() {
     if (STATE.restore) {
         // 恢复是几百个请求，得让人看见它在往前走，不然会以为卡死了
         parts.push(`⏳ 正在还原：${STATE.restore.label}　${STATE.restore.done}/${STATE.restore.total}`);
+    } else if (STATE.download) {
+        // 下载进度是这次专门加的：80 MB 的包在手机上要传好几分钟，
+        // 光看"已 N 秒"分不出是慢还是卡死，有字节数在动就一目了然
+        const d = STATE.download;
+        const secs = STATE.busySince ? Math.floor((Date.now() - STATE.busySince) / 1000) : 0;
+        const amount = d.total
+            ? `${fmtBytes(d.done)} / ${fmtBytes(d.total)}（${Math.floor((d.done / d.total) * 100)}%）`
+            : fmtBytes(d.done);
+        parts.push(`⏳ 正在下载 ${d.label}…　${amount}　已 ${secs} 秒`);
     } else if (STATE.busy) {
         const secs = STATE.busySince ? Math.floor((Date.now() - STATE.busySince) / 1000) : 0;
         parts.push(`⏳ ${STATE.step ? `${STATE.step}…` : '正在同步…'}　已 ${secs} 秒`);
@@ -409,14 +482,14 @@ function nsPath(bucket, key) {
     return parts.join('/');
 }
 
-async function relayFetch(pathname, options = {}) {
+async function relayFetch(pathname, options = {}, timeoutMs = TIMEOUT_MS.relay) {
     const s = requireConfig();
     const headers = { ...(options.headers || {}) };
     headers.Authorization = `Bearer ${s.token}`;
     const base = String(s.relayUrl).replace(/\/+$/, '');
     try {
         return await timedFetch(base + pathname, { ...options, headers }, {
-            timeoutMs: TIMEOUT_MS.relay,
+            timeoutMs,
             what: `中转 ${options.method || 'GET'} ${pathname}`,
         });
     } catch (err) {
@@ -447,10 +520,14 @@ async function relayPut(key, body, contentType) {
     return json;
 }
 
-async function relayGetBlob(key) {
-    const res = await relayFetch(nsPath(null, key));
+/**
+ * 下载整份备份。走逐块读（res.readBlob）而不是 res.blob()，好把进度报给状态栏；
+ * 超时也单独放宽（TIMEOUT_MS.relayDownload），这条路上传的是几十上百 MB。
+ */
+async function relayGetBlob(key, { onProgress, expectedSize } = {}) {
+    const res = await relayFetch(nsPath(null, key), {}, TIMEOUT_MS.relayDownload);
     if (!res.ok) throw new Error(`下载 ${key} 失败 HTTP ${res.status}`);
-    return res.blob();
+    return res.readBlob(onProgress, expectedSize);
 }
 
 async function relayList() {
@@ -2218,7 +2295,25 @@ async function pruneSnapshots(device) {
 
 async function pullOne(device, latest) {
     notify('info', `正在从 ${device} 拉取备份…`);
-    const blob = await relayGetBlob(snapshotKeyOf(device, latest.fileName));
+
+    // 进度交给状态栏：先摆出"0 / 期望大小"，之后每收一块回调里刷新一次。
+    // 写回 STATE 就够了 —— beginBusy 起的 ticker 每秒会重画一次。
+    STATE.download = { label: latest.fileName, done: 0, total: latest.size || 0 };
+    renderStatus();
+
+    let blob;
+    try {
+        blob = await relayGetBlob(snapshotKeyOf(device, latest.fileName), {
+            expectedSize: latest.size,
+            onProgress: (done, total) => {
+                STATE.download = { label: latest.fileName, done, total };
+            },
+        });
+    } finally {
+        // 成不成都要收掉：失败时留着会让状态栏一直停在半截的进度上
+        STATE.download = null;
+    }
+
     if (latest.size && blob.size !== latest.size) {
         throw new Error(`下载的备份大小对不上（期望 ${latest.size}，实际 ${blob.size}），可能传输中断，已放弃恢复`);
     }

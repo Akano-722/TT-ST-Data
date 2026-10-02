@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.6';
+const EXT_VERSION = '2026-10-02.7';
 
 /**
  * 日志也往面板里记一份。
@@ -93,13 +93,15 @@ const TIMEOUT_MS = {
     st: 60 * 1000,
     // 服务端要先把自己几百 MB 的数据打包成 zip 才开始回包，比普通请求慢得多
     backup: 180 * 1000,
-    // 从中转拉整份备份：手机上 80 MB 的包在 60s 里传不完（2026-10-02 真机实测），
-    // 而计时器是"整条链路总共"的预算，不是每一步的。放宽到 5 分钟，状态栏会显示进度，
-    // 真卡住了也能从"数值不动"看出来，不用靠超时来兜。
-    relayDownload: 300 * 1000,
-    // 分片下载时**每一块**的预算。是"整块总共"的预算，不是"静默多久"的看门狗 ——
-    // 1 MB 的块给 120s，等于放行 ≥8.5 KB/s 的连接。
-    chunk: 120 * 1000,
+    // 下载备份（整份单条流式 / 分片，都用这一对）。
+    //   downloadIdle  —— **看门狗**："多久没有新字节"才算死。只要字节还在来就一直续命。
+    //   downloadTotal —— 总上限兜底：一条只吐几字节/分钟的连接不能永远占着状态栏。
+    // 为什么非拆成两个不可：手机上中转下行慢的时候单条连接只有几 KB/s，1 MB 要 200–300s。
+    // 只给"总预算"的话，一堆**慢但在动**的块会被当"卡死"掐掉、换连接重试 ——
+    // 换了还是慢，6 条反复换，最后每块都超时，整包拉不下来（2026-10-02 真机实测）。
+    // 看门狗只咬真正静止的连接，慢的让它慢慢跑。
+    downloadIdle: 120 * 1000,
+    downloadTotal: 10 * 60 * 1000,
 };
 
 /**
@@ -158,25 +160,31 @@ function isAbort(err) {
 }
 
 /**
- * received > 0 时文案换一种说法：已经收到过字节了，说"没有响应"是误导 ——
- * 它明明响应了、只是半路停住。手机上只能看这一行，得能分出"卡住"和"慢"。
+ * 超时错误。文案要能一眼分清是**哪种**超时，三种情况说的不是一回事：
  *
- * idleMs 是"最后一块数据距今多久"，只有调用方真的记了这个时刻才传。
- * **不要拿 timeoutMs 冒充它**：那个计时器是"整条链路总共给多少秒"的总预算，
- * 不是"静默多久就掐"的看门狗。写成"N 秒没有新数据"会把人往"中途卡住"上带，
- * 而真相可能是"从头到尾就没动过"（2026-10-02 就为这句话多绕了一轮）。
+ *   received = 0        → 压根没收到过东西（"没有响应"）
+ *   idleLimitMs > 0     → 看门狗咬的：确实是 idleLimitMs 这么久没有新字节了
+ *   其余（总预算到）    → "没下完"，并且带上"最后一块数据是多久前"，好和上一种区分开
+ *
+ * **不要拿总预算冒充静默时长**：总预算到点时，数据可能一秒前还在流，
+ * 写成"N 秒没有新数据"会把人往"中途卡住"上带（2026-10-02 就为这句话多绕了一轮）。
  */
-function timeoutError(what, timeoutMs, received = 0, idleMs = null) {
-    const seconds = timeoutMs / 1000;
+function timeoutError(what, { totalMs, idleLimitMs = 0, received = 0, sinceLastByteMs = null }) {
+    // 报哪个数：看门狗咬的就说看门狗的值，否则说总预算
+    const seconds = (idleLimitMs || totalMs) / 1000;
     // 不取整：测试里挂的是几百毫秒，取整会变成"0 秒没有响应"
     const shown = Number.isInteger(seconds) ? seconds : seconds.toFixed(1);
+
     let detail;
     if (!received) {
         detail = '没有响应';
+    } else if (idleLimitMs) {
+        detail = `没有新数据，已收 ${fmtBytes(received)}`;
     } else {
-        const idle = Number.isFinite(idleMs) ? `，最后一块数据是 ${(idleMs / 1000).toFixed(1)} 秒前` : '';
+        const idle = Number.isFinite(sinceLastByteMs) ? `，最后一块数据是 ${(sinceLastByteMs / 1000).toFixed(1)} 秒前` : '';
         detail = `没下完，已收 ${fmtBytes(received)}${idle}`;
     }
+
     const err = new Error(`${what} 超时：${shown} 秒${detail}，已中断`);
     err.isTimeout = true;
     return err;
@@ -193,7 +201,9 @@ function timeoutError(what, timeoutMs, received = 0, idleMs = null) {
  *
  * 每步都记一行日志，状态栏也会实时显示"卡在哪一步、已经多久"，手机上不用开控制台就能看。
  */
-async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what = '请求', signal = null } = {}) {
+async function timedFetch(url, options = {}, {
+    timeoutMs = TIMEOUT_MS.st, what = '请求', signal = null, idleMs = 0,
+} = {}) {
     const controller = new AbortController();
     const started = Date.now();
 
@@ -210,23 +220,47 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
     STATE.step = what;
     renderStatus();
 
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // 两个计时器，作用完全不同：
+    //   totalTimer —— 总预算，兜底。慢但在动的请求也总得有个头，不能无限期占着。
+    //   idleTimer  —— 看门狗。给了 idleMs 才有；只要还有字节进来就续命（见下面的 res.touch）。
+    // 大文件下载必须靠后者。只给总预算的话，慢连接会被当成"卡死"掐掉换连接，
+    // 换了还是慢 —— 最后每一块都死在同一个总预算上（2026-10-02 真机就是这个形态）。
+    let timedOutBy = 'total';
+    const totalTimer = setTimeout(() => {
+        timedOutBy = 'total';
+        controller.abort();
+    }, timeoutMs);
+
+    let idleTimer = null;
+    const armIdle = () => {
+        if (!idleMs) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+            timedOutBy = 'idle';
+            controller.abort();
+        }, idleMs);
+    };
+    armIdle();
 
     /** 计时器（和那条外部信号的监听）留到 body 读完才收，不能拿到响应头就清 */
     const cleanup = () => {
-        clearTimeout(timer);
+        clearTimeout(totalTimer);
+        if (idleTimer) clearTimeout(idleTimer);
         if (signal) signal.removeEventListener('abort', onExternalAbort);
     };
 
+    /** 这次超时是按哪个表判的，错误文案得说实话 */
+    const timeoutArgs = () => (timedOutBy === 'idle' ? { totalMs: timeoutMs, idleLimitMs: idleMs } : { totalMs: timeoutMs });
+
     let res;
     try {
-        log(`${what} 发出（超时 ${timeoutMs / 1000}s）：${url}`);
+        log(`${what} 发出（超时 ${timeoutMs / 1000}s${idleMs ? `，静默 ${idleMs / 1000}s 算死` : ''}）：${url}`);
         res = await fetch(url, { ...options, signal: controller.signal });
     } catch (err) {
         cleanup();
         if (isAbort(err)) {
             log(`${what} 超时，用时 ${Date.now() - started}ms`);
-            throw timeoutError(what, timeoutMs);
+            throw timeoutError(what, timeoutArgs());
         }
         log(`${what} 失败，用时 ${Date.now() - started}ms`, err);
         throw err;
@@ -248,7 +282,7 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
                 if (isAbort(err)) {
                     // 这个分支就是 TT 手机端卡死的形态：头回来了、body 永远不结束
                     log(`${what} 读 body 超时（响应头是 ${Date.now() - headerAt}ms 前到的），已中断`);
-                    throw timeoutError(what, timeoutMs);
+                    throw timeoutError(what, timeoutArgs());
                 }
                 log(`${what} 读 body 失败`, err);
                 throw err;
@@ -269,11 +303,17 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
     res.dispose = cleanup;
 
     /**
+     * "又有字节进来了" —— 喂狗，把静默计时器重新计上。
+     * 只有给了 idleMs 的请求才有效果；没有 idleMs 时是空操作。
+     */
+    res.touch = armIdle;
+
+    /**
      * 逐块读版。给大文件下载用：`res.blob()` 是一次性的，中途拿不到任何反馈，
      * 手机上只能干等——分不出"在慢慢爬"和"卡死了"。
      *
-     * 计时器语义不变（还是整条链路的总预算），只是每收到一块就调一次 onProgress，
-     * 让状态栏能显示进度。total 优先用调用方给的（它知道该多大），
+     * 每收到一块就 ①喂狗 ②调一次 onProgress。**喂狗是关键**：慢连接只要还在出字节
+     * 就不会被掐，只有真的静默了才轮到看门狗咬。total 优先用调用方给的（它知道该多大），
      * 否则退回响应头里的 Content-Length；都没有就是 0，界面只显示已下载字节。
      */
     res.readBlob = async (onProgress, expectedSize) => {
@@ -297,15 +337,16 @@ async function timedFetch(url, options = {}, { timeoutMs = TIMEOUT_MS.st, what =
                 chunks.push(value);
                 received += value.length;
                 lastByteAt = Date.now();
+                armIdle();
                 if (onProgress) onProgress(received, total);
             }
             log(`${what} body 读完，总共 ${Date.now() - started}ms，${received} 字节`);
             return new Blob(chunks);
         } catch (err) {
             if (isAbort(err)) {
-                const idleMs = received ? Date.now() - lastByteAt : null;
-                log(`${what} 读 body 超时（已收 ${received} 字节${Number.isFinite(idleMs) ? `，最后一块数据是 ${(idleMs / 1000).toFixed(1)} 秒前` : ''}），已中断`);
-                throw timeoutError(what, timeoutMs, received, idleMs);
+                const sinceLastByte = received ? Date.now() - lastByteAt : null;
+                log(`${what} 读 body 超时（已收 ${received} 字节${Number.isFinite(sinceLastByte) ? `，最后一块数据是 ${(sinceLastByte / 1000).toFixed(1)} 秒前` : ''}），已中断`);
+                throw timeoutError(what, { ...timeoutArgs(), received, sinceLastByteMs: sinceLastByte });
             }
             log(`${what} 读 body 失败（已收 ${received} 字节）`, err);
             throw err;
@@ -581,8 +622,8 @@ function nsPath(bucket, key) {
 
 async function relayFetch(pathname, options = {}, timeoutMs = TIMEOUT_MS.relay) {
     const s = requireConfig();
-    // what / signal 是我们自己用的，不能混进 fetch 的 init 里
-    const { what: label, signal, ...rest } = options;
+    // what / signal / idleMs 是我们自己用的，不能混进 fetch 的 init 里
+    const { what: label, signal, idleMs, ...rest } = options;
     const headers = { ...(rest.headers || {}) };
     headers.Authorization = `Bearer ${s.token}`;
     const base = String(s.relayUrl).replace(/\/+$/, '');
@@ -591,6 +632,7 @@ async function relayFetch(pathname, options = {}, timeoutMs = TIMEOUT_MS.relay) 
             timeoutMs,
             what: label || `中转 ${rest.method || 'GET'} ${pathname}`,
             signal,
+            idleMs,
         });
     } catch (err) {
         // 超时已经说清楚了是超时，别再包成"连不上"
@@ -642,7 +684,8 @@ async function fetchChunk(key, start, end, signal, onBytes) {
         headers: { Range: `bytes=${start}-${end}` },
         what: `中转分片 ${start}-${end}（${fmtBytes(want)}）`,
         signal,
-    }, TIMEOUT_MS.chunk);
+        idleMs: TIMEOUT_MS.downloadIdle,
+    }, TIMEOUT_MS.downloadTotal);
 
     if (res.status !== 206) {
         // 关键：不想要这份响应体就必须**主动取消**它。否则浏览器会把整份（中转没升级时
@@ -692,9 +735,11 @@ async function downloadChunked(key, size, { onProgress } = {}) {
         if (!onProgress) return;
         let done = received;
         for (const bytes of inflight.values()) done += bytes;
-        // 只在真的变了才回调：同一块"先报在途、再报落账"是同一个数，
-        // 不去重的话进度序列会出现平台期，"是否单调递增"这类判断就全是噪声。
-        if (done === lastReported) return;
+        // 只增不减。一块超时作废时它收到的字节会被扣掉，进度就会**往回跳** ——
+        // 真机上看到"到了 3 MB 又退回 1 MB"就是这么来的，比不动还吓人。
+        // "有几块作废重来"是日志该说的事，不该让进度条去表达。
+        // 同时这里也顺手去重：同一块"先报在途、再报落账"是同一个数。
+        if (done <= lastReported) return;
         lastReported = done;
         onProgress(done, size);
     };
@@ -784,7 +829,7 @@ async function relayGetBlob(key, { onProgress, expectedSize } = {}) {
         }
     }
 
-    const res = await relayFetch(nsPath(null, key), {}, TIMEOUT_MS.relayDownload);
+    const res = await relayFetch(nsPath(null, key), { idleMs: TIMEOUT_MS.downloadIdle }, TIMEOUT_MS.downloadTotal);
     if (!res.ok) throw new Error(`下载 ${key} 失败 HTTP ${res.status}`);
     return res.readBlob(onProgress, expectedSize);
 }

@@ -350,9 +350,13 @@ async function testDownloadProgress(bad_) {
             bad('total 没用调用方给的 expectedSize', JSON.stringify(seen.slice(0, 2)));
         } else ok('total 用的是调用方给的 expectedSize（不是等 Content-Length）');
 
-        if (!lines.some((l) => l.includes('超时 300s'))) {
-            bad('下载没挂上放宽后的 300s 超时', lines.join(' | ') || '（没有日志）');
-        } else ok('下载按 300s 计时，不再被别人的 60s 掐断');
+        // 日志里要同时出现"总上限"和"看门狗"两个数 —— 只有总上限的话，
+        // 手机上几 KB/s 的连接会被当成卡死反复掐掉（2026-10-02 真机根因）
+        if (!lines.some((l) => l.includes('超时 600s'))) {
+            bad('下载没挂上总上限', lines.join(' | ') || '（没有日志）');
+        } else if (!lines.some((l) => l.includes('静默 120s 算死'))) {
+            bad('下载没挂上看门狗', lines.join(' | ') || '（没有日志）');
+        } else ok('下载挂了"总上限 600s + 静默看门狗 120s"，不再被别人的 60s 掐断');
     } finally {
         await srv.close();
     }
@@ -445,14 +449,16 @@ async function testTimeoutWiring(bad_) {
         if (api.TIMEOUT_MS.relay !== 60000 || api.TIMEOUT_MS.st !== 60000) {
             bad('中转/酒馆超时不是 60s', JSON.stringify(api.TIMEOUT_MS));
         } else ok('TIMEOUT_MS.relay / st = 60s');
-        // 下载整份备份走的是单独放宽的那个值，不能和普通中转请求共用一个 60s
-        if (api.TIMEOUT_MS.relayDownload !== 300000) {
-            bad('下载备份的超时不是 300s', String(api.TIMEOUT_MS.relayDownload));
-        } else ok('TIMEOUT_MS.relayDownload = 300s（手机上 80 MB 的包 60s 传不完）');
-        // 分片是每块单独计时的，不能和整份的那个 300s 共用一个值
-        if (api.TIMEOUT_MS.chunk !== 120000) {
-            bad('分片超时不是 120s', String(api.TIMEOUT_MS.chunk));
-        } else ok('TIMEOUT_MS.chunk = 120s（每块单独预算，慢块能跑完、死块才被换掉）');
+        // 下载走的是"看门狗 + 总上限"两个值，不能和普通中转请求共用一个 60s。
+        // 光有总上限是不够的：手机上单条连接只有几 KB/s，1 MB 要 200–300s，
+        // 用总预算去卡会把**慢但在动**的块全掐掉（2026-10-02 真机就是这个形态）。
+        if (api.TIMEOUT_MS.downloadIdle !== 120000) {
+            bad('下载的静默看门狗不是 120s', String(api.TIMEOUT_MS.downloadIdle));
+        } else if (!(api.TIMEOUT_MS.downloadTotal > api.TIMEOUT_MS.downloadIdle)) {
+            bad('下载总上限没比看门狗大', JSON.stringify(api.TIMEOUT_MS));
+        } else {
+            ok(`下载用"看门狗 ${api.TIMEOUT_MS.downloadIdle / 1000}s + 总上限 ${api.TIMEOUT_MS.downloadTotal / 1000}s"两段计时`);
+        }
 
         // 上传的预算得按体积算。固定 60s 意味着 150 MB 要跑 2.5 MB/s 才不超时 ——
         // 真机上手机慢到 100 KB/s 时，传到 6 MB 就被自己的表掐了（链路其实还在动）。
@@ -789,17 +795,21 @@ async function testDetect(bad_) {
  * @param {number|Function} o.delayMs 每块的延迟（可给 index 的函数），用来控制谁先跑完
  * @param {number} o.stallChunk  这一块回 206 但**体永远不结束**（验"卡住时报不报已收字节"）
  * @param {number} o.stallBytes  stallChunk 卡住前先吐这么多字节；0 = 一个字节都没有
+ * @param {number} o.dripChunk   这一块**挤牙膏**：每 dripIntervalMs 吐 dripBytes 字节
+ *                               （验"慢但在动"的连接不该被看门狗咬死）
+ * @param {number} o.dripStopAfter 吐够几次就停手；默认一直吐到发完（停手 = 真静默了）
  */
 function makeRangeStub({
     size, ignoreRange = false, failChunk = -1, chunkSize, failTimes = 1, delayMs = 15, dangling = false,
-    stallChunk = -1, stallBytes = 0,
+    stallChunk = -1, stallBytes = 0, dripChunk = -1, dripIntervalMs = 40, dripBytes = 256,
+    dripStopAfter = Infinity,
 }) {
     const body = Buffer.alloc(size);
     for (let i = 0; i < size; i += 1) body[i] = i & 0xff;
 
     const state = {
         inFlight: 0, maxInFlight: 0, requests: 0, attempts: new Map(),
-        ok: 0, aborted: 0, dangling: 0, cancelled: 0, stalling: 0,
+        ok: 0, aborted: 0, dangling: 0, cancelled: 0, stalling: 0, dripping: 0,
     };
     const delayOf = (index) => (typeof delayMs === 'function' ? delayMs(index) : delayMs);
 
@@ -846,6 +856,42 @@ function makeRangeStub({
             const n = (state.attempts.get(index) || 0) + 1;
             state.attempts.set(index, n);
             if (index === failChunk && n <= failTimes) return new Response('boom', { status: 500 });
+
+            if (index === dripChunk) {
+                // 慢连接：每隔一会儿吐一小口。真机上中转下行被限速时就是这个形态 ——
+                // 字节一直在来，只是一秒才几 KB。看门狗必须认得出它还活着。
+                state.dripping += 1;
+                const bytes = body.subarray(start, end + 1);
+                let sent = 0;
+                let ticks = 0;
+                let tick = null;
+                const stop = () => {
+                    if (tick) { clearInterval(tick); tick = null; }
+                };
+                return new Response(new ReadableStream({
+                    start(controller) {
+                        tick = setInterval(() => {
+                            if (ticks >= dripStopAfter) { stop(); return; }   // 停手 = 真静默，看门狗该咬
+                            if (sent >= bytes.length) { stop(); controller.close(); return; }
+                            ticks += 1;
+                            const part = bytes.subarray(sent, sent + dripBytes);
+                            sent += part.length;
+                            controller.enqueue(part);
+                        }, dripIntervalMs);
+                        if (ac) ac.addEventListener('abort', () => {
+                            stop();
+                            controller.error(new DOMException('Aborted', 'AbortError'));
+                        }, { once: true });
+                    },
+                    cancel() { stop(); state.cancelled += 1; },
+                }), {
+                    status: 206,
+                    headers: {
+                        'Content-Range': `bytes ${start}-${end}/${size}`,
+                        'Content-Type': 'application/octet-stream',
+                    },
+                });
+            }
 
             if (index === stallChunk) {
                 // 头按 206 正常回，体先吐 stallBytes 字节，然后**就这么悬着**。
@@ -1114,8 +1160,9 @@ async function testChunkStallReportsBytes(bad_) {
     });
     const ext = loadExtension({ fetchImpl: impl, seed: configSeed('http://relay.test') });
 
-    // 只关心"卡住时报什么"，把每块预算压到 400ms，别让用例真等 2 分钟
-    ext.api.TIMEOUT_MS.chunk = 400;
+    // 只关心"卡住时报什么"，把看门狗压到 400ms，别让用例真等 2 分钟。
+    // 总上限留着不动：要验的正是"看门狗咬人"这条路径，不是总预算。
+    ext.api.TIMEOUT_MS.downloadIdle = 400;
 
     const seen = [];
     let err = null;
@@ -1176,6 +1223,84 @@ async function testChunkStallReportsBytes(bad_) {
         bad_('又打出了"响应头 N ms 前就到了"这种不实的话', '那是请求至今的耗时，不是头的到达时刻');
     } else {
         ok('响应头到达时刻是真记的（用时 Xms），没有拿总耗时冒充');
+    }
+}
+
+/**
+ * 慢但在动的连接**不能**被掐。
+ *
+ * 这是 2026-10-02 真机第四轮的根因：分片用"整块总共 120s"的总预算去卡，
+ * 而手机上单条连接只有几 KB/s，1 MB 要 200–300s —— 于是**每一块都在 120s 被掐掉**，
+ * 换新连接重试还是慢，6 条一起反复换，最后全超时，整包一个字都拉不回来。
+ * 用户看到的现象是进度爬到 3 MB 又退回 1 MB（退回是我扣掉作废块的字节，也已修）。
+ *
+ * 现在改成看门狗：**只要还在出字节就续命**，只有真的静默才咬。
+ * 这条用例把两种形态钉死：一直在爬的必须跑完，爬一半停手的必须被咬。
+ */
+async function testChunkSlowDripSurvives(bad_) {
+    console.log('\n── 慢连接：一直在爬的不该被掐，停下来的才该 ──');
+
+    const { api } = loadExtension({ fetchImpl: async () => json({}), seed: configSeed('http://relay.test') });
+    const CHUNK = 4096;   // 直接测 fetchChunk，用小段就够，不用真拉 1 MB
+
+    // 看门狗 200ms；挤牙膏每 40ms 一口，一口 256 字节 → 4096 字节要 ~640ms。
+    // 640ms 远大于 200ms 的看门狗，**但每一口都在续命**，所以必须活下来。
+    const drip = makeRangeStub({
+        size: CHUNK * 2, chunkSize: CHUNK, dripChunk: 0, dripIntervalMs: 40, dripBytes: 256,
+    });
+    const ext = loadExtension({ fetchImpl: drip.impl, seed: configSeed('http://relay.test') });
+    ext.api.TIMEOUT_MS.downloadIdle = 200;
+    ext.api.TIMEOUT_MS.downloadTotal = 10000;
+
+    const seen = [];
+    let err = null;
+    let blob = null;
+    try {
+        blob = await ext.api.fetchChunk('devices/cloud/snapshots/big.zip', 0, CHUNK - 1, null, (n) => seen.push(n));
+    } catch (e) {
+        err = e;
+    }
+
+    const tookMs = seen.length ? seen.length : 0;
+    if (err) {
+        bad_('慢但在动的分片被掐了', `${err.message}（看门狗把"慢"当成了"死"；真机上就是这么全灭的）`);
+    } else if (!blob || blob.size !== CHUNK) {
+        bad_('慢分片回来了但长度不对', String(blob && blob.size));
+    } else {
+        ok(`每口只 256 B、总共用了 ~${Math.round((CHUNK / 256) * 40)}ms 的慢分片跑完了（看门狗 200ms 没咬它）`);
+    }
+    if (seen.length < 5) {
+        bad_('慢分片没有逐口报进度', `只回调了 ${seen.length} 次；状态栏会看着像卡死`);
+    } else {
+        ok(`慢分片逐口报了 ${seen.length} 次进度（${tookMs} 字节那一次是最后一口）`);
+    }
+
+    // 爬一半停手 = 真静默，看门狗必须咬，而且要报出已经收了多少
+    const stall = makeRangeStub({
+        size: CHUNK * 2, chunkSize: CHUNK, dripChunk: 1, dripIntervalMs: 30, dripBytes: 200,
+        dripStopAfter: 2,
+    });
+    const ext2 = loadExtension({ fetchImpl: stall.impl, seed: configSeed('http://relay.test') });
+    ext2.api.TIMEOUT_MS.downloadIdle = 200;
+    ext2.api.TIMEOUT_MS.downloadTotal = 10000;
+
+    let err2 = null;
+    try {
+        await ext2.api.fetchChunk('devices/cloud/snapshots/big.zip', CHUNK, CHUNK * 2 - 1, null, () => {});
+    } catch (e) {
+        err2 = e;
+    }
+
+    if (!err2) {
+        bad_('停下来不动的分片没被掐', '会一直占着连接等下去');
+    } else if (!err2.isTimeout) {
+        bad_('静默超时没标成超时', err2.message);
+    } else if (!err2.message.includes('没有新数据')) {
+        bad_('看门狗咬人时没说清是"没有新数据"', `${err2.message}；这句是看门狗专用的，和"总预算到点"必须分得开`);
+    } else if (!err2.message.includes(api.fmtBytes(400))) {
+        bad_('没说清静默前收了多少', `期望 ${api.fmtBytes(400)}（2 口 × 200 B），实际：${err2.message}`);
+    } else {
+        ok(`爬一半停手的被看门狗咬掉，并说清了已收 400 B：${err2.message.slice(0, 64)}…`);
     }
 }
 
@@ -1665,6 +1790,7 @@ async function main() {
     await testChunkedFallback(bad);
     await testChunkedFailureAbortsSiblings(bad);
     await testChunkStallReportsBytes(bad);
+    await testChunkSlowDripSurvives(bad);
     await testTimeoutWiring(bad);
     await testDetect(bad);
     await testTavBranch(bad);

@@ -13,7 +13,7 @@
 const LOG = '[ST-Sync]';
 
 /** 改 index.js 就把这个抬一下。手机上点完「更新」先看这一行，确认跑的到底是哪一版 */
-const EXT_VERSION = '2026-10-02.9';
+const EXT_VERSION = '2026-10-21.1';
 
 /**
  * 日志也往面板里记一份。
@@ -138,6 +138,19 @@ const DOWNLOAD_CHUNK_SIZE = 1024 * 1024;            // 每块 1 MB
 const DOWNLOAD_CONCURRENCY = 6;                     // 并发连接数（实测 6 条合计 3.2 MB/s）
 const DOWNLOAD_CHUNK_RETRIES = 3;                   // 每块最多重试次数（每次换新连接）
 const DOWNLOAD_PARALLEL_MIN_BYTES = 8 * 1024 * 1024; // 小于这个仍走单条流式（省连接开销）
+
+/* ------------------------------------------------------------------ *
+ * 分片追加上传（TT 大包专用）
+ *
+ * 起因（2026-10-21 真机）：240 MB 的包在手机上每次都死在打包末尾。整包驻留内存，
+ * 再加上文本编码副本和最终 Blob 构造，峰值超过 iOS WebView 的上限，页面被系统杀掉
+ * 后重载。包只会越来越大，所以不能靠"省一点内存"，得改成边收集边拼 zip、每片
+ * 4 MB 直接追加到中转，内存只和单片大小有关。
+ * 中转侧的接口是 /v1/uploads（见 relay/lib/uploads.js），旧中转没有这个能力时
+ * 自动退回整包 PUT。
+ * ------------------------------------------------------------------ */
+const UPLOAD_PART_SIZE = 4 * 1024 * 1024; // 每片 4 MB
+const UPLOAD_PART_RETRIES = 2;            // 每片最多再试 2 次（同一 seq，中转会幂等去重）
 
 /**
  * 中转没（升级到）支持 Range 的信号。
@@ -428,6 +441,7 @@ const STATE = {
     suppressDirty: false, // 恢复数据期间挂起改动检测，避免把恢复本身误判成用户改动
     restore: null,        // 恢复进行中时是 { label, done, total }，用来在状态栏显示进度
     download: null,       // 从中转下载备份时是 { label, done, total }（字节），同上
+    upload: null,         // 边打包边上传时是 { label, uploaded, packed, entries }，同上
 };
 
 let ui = {};
@@ -548,6 +562,7 @@ function endBusy() {
     STATE.step = '';
     // 进度条属于"这一轮"的，收工时必须清掉，否则下一轮一进来就顶着上一次的数字
     STATE.download = null;
+    STATE.upload = null;
     if (STATE.ticker) {
         clearInterval(STATE.ticker);
         STATE.ticker = null;
@@ -580,6 +595,15 @@ function renderStatus() {
             : fmtBytes(d.done);
         // verb 默认"下载"：这个进度条先是给下载用的，暂存那条路复用同一套显示
         parts.push(`⏳ 正在${d.verb || '下载'} ${d.label}…　${amount}　已 ${secs} 秒`);
+    } else if (STATE.upload) {
+        // 边打包边上传：不显示百分比——开始上传时还不知道最终包多大。
+        // "已上传"和"已打包"分开报，能看出是卡在酒馆读取还是中转上传。
+        const u = STATE.upload;
+        const secs = STATE.busySince ? Math.floor((Date.now() - STATE.busySince) / 1000) : 0;
+        parts.push(
+            `⏳ 正在上传 ${u.label}…　已上传 ${fmtBytes(u.uploaded)}` +
+            `　已打包 ${fmtBytes(u.packed)} / ${u.entries} 个条目　已 ${secs} 秒`,
+        );
     } else if (STATE.busy) {
         const secs = STATE.busySince ? Math.floor((Date.now() - STATE.busySince) / 1000) : 0;
         parts.push(`⏳ ${STATE.step ? `${STATE.step}…` : '正在同步…'}　已 ${secs} 秒`);
@@ -669,6 +693,109 @@ async function relayPut(key, body, contentType) {
     const json = await readJsonSafe(res);
     if (!res.ok) throw new Error(`上传 ${key} 失败 HTTP ${res.status}：${json.error || JSON.stringify(json).slice(0, 200)}`);
     return json;
+}
+
+/* ------------------------------------------- 分片追加上传（TT 大包专用） */
+
+/**
+ * 问中转支不支持分片上传。
+ * 旧中转没有 /v1/meta 或没有 features 字段，返回空对象，上层据此退回整包 PUT。
+ */
+async function relayFeatures() {
+    const res = await relayFetch('/v1/meta', {}, TIMEOUT_MS.relay);
+    const json = await readJsonSafe(res);
+    // 404 = 老版本中转，连 /v1/meta 都没有。这是唯一能安心退回整包 PUT 的情况；
+    // 网络错误直接往上抛 —— 那种时候退回整包只会先把手机内存撑爆，再失败一遍。
+    if (res.status === 404) return {};
+    if (!res.ok) throw new Error(`中转 /v1/meta 失败 HTTP ${res.status}：${json.error || ''}`);
+    return json.features || {};
+}
+
+/**
+ * 上传路由的两种形状（和中转 server.js 对得上）：
+ *   开会话   /v1/uploads/<ns>/<bucket>
+ *   后续操作 /v1/uploads/<ns>/<uploadId>[/part/<seq>|/finish]
+ * uploadId 里已经绑定了 bucket，后续不用再带。
+ */
+function uploadBeginPath() {
+    const s = requireConfig();
+    return `/v1/uploads/${encodeURIComponent(s.namespace)}/${encodeURIComponent(s.bucket || 'tavern')}`;
+}
+
+function uploadSessionPath(uploadId, ...rest) {
+    const s = requireConfig();
+    return [`/v1/uploads/${encodeURIComponent(s.namespace)}/${encodeURIComponent(uploadId)}`]
+        .concat(rest.map((part) => `/${encodeURIComponent(String(part))}`))
+        .join('');
+}
+
+/** 开一个上传会话。key 放 JSON 体里，因为文件路径本身带 "/" */
+async function relayUploadBegin(key) {
+    const res = await relayFetch(uploadBeginPath(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+    }, TIMEOUT_MS.relay);
+    const json = await readJsonSafe(res);
+    if (!res.ok) throw new Error(`开上传会话失败 HTTP ${res.status}：${json.error || ''}`);
+    if (!json.uploadId) throw new Error('开上传会话失败：中转没回 uploadId');
+    return json.uploadId;
+}
+
+/**
+ * 发一片。失败就用**同一个 seq** 重试：中转对"上一片"做了幂等处理
+ * （上一片其实已经落盘时直接返回成功，不会重复追加）。
+ *
+ * 404/409 不重试：前者是会话没了（中转重启/过期），后者说明 seq 逻辑坏了，
+ * 再试也是白试。
+ */
+async function relayUploadPart(uploadId, seq, blob) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= UPLOAD_PART_RETRIES; attempt += 1) {
+        if (attempt > 0) log(`上传分片 ${seq} 第 ${attempt} 次重试（${fmtBytes(blob.size)}）`);
+        try {
+            const res = await relayFetch(uploadSessionPath(uploadId, 'part', seq), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: blob,
+                what: `上传分片 ${seq}（${fmtBytes(blob.size)}）`,
+            }, uploadTimeoutFor(blob.size));
+            const json = await readJsonSafe(res);
+            if (res.ok) return json;
+
+            const err = new Error(`上传分片 ${seq} 失败 HTTP ${res.status}：${json.error || ''}`);
+            if (res.status === 404 || res.status === 409) err.uploadFatal = true;
+            throw err;
+        } catch (err) {
+            lastErr = err;
+            if (err.uploadFatal) throw err;
+            log(`上传分片 ${seq} 失败`, err);
+        }
+    }
+    throw new Error(
+        `上传分片 ${seq} 重试 ${UPLOAD_PART_RETRIES} 次仍失败：${lastErr ? lastErr.message : '未知错误'}`,
+    );
+}
+
+/** 结束上传：中转校验大小后原子 rename 到最终路径，返回 size/mtime/sha256 */
+async function relayUploadFinish(uploadId, expectedSize) {
+    const res = await relayFetch(uploadSessionPath(uploadId, 'finish'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expectedSize }),
+    }, TIMEOUT_MS.relay);
+    const json = await readJsonSafe(res);
+    if (!res.ok) throw new Error(`结束上传失败 HTTP ${res.status}：${json.error || ''}`);
+    return json;
+}
+
+/** 放弃上传。失败只记日志 —— 这是收尾动作，不该盖住真正的错误 */
+async function relayUploadAbort(uploadId) {
+    try {
+        await relayFetch(uploadSessionPath(uploadId), { method: 'DELETE' }, TIMEOUT_MS.relay);
+    } catch (err) {
+        console.warn(LOG, '放弃上传会话失败', err);
+    }
 }
 
 /**
@@ -1157,16 +1284,19 @@ function jsonlOf(messages, what) {
 }
 
 /**
- * 逐类把数据读出来，拼成 zip 条目的数组。
+ * 逐类把数据读出来，**一条一条 yield**。
+ *
+ * 为什么是生成器：240 MB 的包如果把所有条目先攒在数组里再拼 zip，手机内存撑不住
+ * （2026-10-21 真机：每次死在打包末尾，页面直接被系统杀掉重载）。生成器让调用方
+ * 读一条、拼一条、立刻发一片，内存里同时只有当前条目和一片缓冲。
  *
  * 顺序照 RESTORE_ORDER 的意思来：角色卡 → 它的聊天 → 群组 → 群聊 → 世界书 → 设置（放最后）。
  * 每类都记一行日志：手机上出问题只能靠面板日志，必须看得出"读到哪一步、读到了多少"。
  *
- * @returns {Promise<{entries: Array, skipped: string[]}>}
+ * @param {string[]} skipped 读不出来的项往这里记
+ * @returns {AsyncGenerator<{name: string, data: string|Uint8Array|ArrayBuffer}>}
  */
-async function collectTtEntries() {
-    const entries = [];
-    const skipped = [];
+async function* iterateTtEntries(skipped) {
 
     const step = (what) => {
         STATE.step = what;
@@ -1201,7 +1331,7 @@ async function collectTtEntries() {
                 { avatar_url: card.avatar, format: 'png' },
                 `导出角色卡 ${card.avatar}`,
             );
-            entries.push({ name: `characters/${card.avatar}`, data: bytes });
+            yield { name: `characters/${card.avatar}`, data: bytes };
         } catch (err) {
             log(`跳过角色卡 ${card.avatar}`, err);
             skipped.push(`角色卡 ${card.avatar}：${err.message}`);
@@ -1228,7 +1358,7 @@ async function collectTtEntries() {
                     { avatar_url: card.avatar, file_name: `${id}.jsonl` },
                     `读聊天 ${id}`,
                 );
-                entries.push({ name: `chats/${stem}/${id}.jsonl`, data: jsonlOf(messages, `聊天 ${id}`) });
+                yield { name: `chats/${stem}/${id}.jsonl`, data: jsonlOf(messages, `聊天 ${id}`) };
             } catch (err) {
                 log(`跳过聊天 ${id}`, err);
                 skipped.push(`聊天 ${stem}/${id}：${err.message}`);
@@ -1244,7 +1374,7 @@ async function collectTtEntries() {
     for (const group of groupList) {
         const groupId = ttSafeName(group && (group.id || group.chat_id));
         if (!groupId) continue;
-        entries.push({ name: `groups/${groupId}.json`, data: JSON.stringify(group, null, 2) });
+        yield { name: `groups/${groupId}.json`, data: JSON.stringify(group, null, 2) };
 
         // 群聊 id 列表：chats 是历史，chat_id 是当前，取并集免得漏
         const chatIds = new Set(Array.isArray(group.chats) ? group.chats.filter(Boolean) : []);
@@ -1256,7 +1386,7 @@ async function collectTtEntries() {
             step(`读群聊 ${chatId}`);
             try {
                 const messages = await ttReadJson(TT_API.groupChatGet, { id: chatId }, `读群聊 ${chatId}`);
-                entries.push({ name: `group chats/${chatId}.jsonl`, data: jsonlOf(messages, `群聊 ${chatId}`) });
+                yield { name: `group chats/${chatId}.jsonl`, data: jsonlOf(messages, `群聊 ${chatId}`) };
             } catch (err) {
                 log(`跳过群聊 ${chatId}`, err);
                 skipped.push(`群聊 ${chatId}：${err.message}`);
@@ -1275,7 +1405,7 @@ async function collectTtEntries() {
         step(`读世界书 ${safe}`);
         try {
             const data = await ttReadJson(TT_API.worldGet, { name }, `读世界书 ${safe}`);
-            entries.push({ name: `worlds/${safe}.json`, data: JSON.stringify(data, null, 2) });
+            yield { name: `worlds/${safe}.json`, data: JSON.stringify(data, null, 2) };
             worldOk += 1;
         } catch (err) {
             log(`跳过世界书 ${safe}`, err);
@@ -1285,19 +1415,31 @@ async function collectTtEntries() {
     log(`逐类读：世界书 ${worldOk}/${worldNames.length} 本`);
 
     // ---- 预设 / 主题 / 快捷回复 / 界面布局 / 各 AI 预设：平铺在设置响应的兄弟字段上 ----
-    collectTtPresets(wrapper, entries, skipped);
+    // collectTtPresets 靠数组去重，量很小（几十上百条），先收在本地数组里再逐条吐
+    const presets = [];
+    collectTtPresets(wrapper, presets, skipped);
+    for (const preset of presets) yield preset;
 
     // ---- 背景图 / 用户头像：TT 只给"名字列表"，字节得自己按前端那套相对路径去取 ----
-    await collectTtImages(entries, skipped);
+    yield* iterateTtImages(skipped);
 
     // ---- 设置放最后 ----
-    entries.push({ name: 'settings.json', data: JSON.stringify(settings, null, 2) });
+    yield { name: 'settings.json', data: JSON.stringify(settings, null, 2) };
 
     // ---- 读不出来的类，点名跳过 ----
     for (const [api, label] of TT_NO_READ_API) {
         skipped.push(`跳过${label}：TT 没有读接口（${api}）`);
     }
+}
 
+/**
+ * 兼容包装：整包路径（旧中转 / 测试）还是需要数组。
+ * 注意这条路会把所有条目攒在内存里，只适合小包或测试，别在手机上传里用。
+ */
+async function collectTtEntries() {
+    const skipped = [];
+    const entries = [];
+    for await (const entry of iterateTtEntries(skipped)) entries.push(entry);
     return { entries, skipped };
 }
 
@@ -1340,7 +1482,7 @@ function ttImageUrl(dir, rel) {
  * 所以这里是**尽力而为**：照前端用的相对路径取一次，取回来不是图片（多半是前端页面
  * 的 HTML，状态码还是 200）就当没有，记进 skipped。宁可少这一类，也不往包里塞垃圾。
  */
-async function collectTtImages(entries, skipped) {
+async function* iterateTtImages(skipped) {
     const fetchImage = async (url, what) => {
         try {
             const res = await timedFetch(url, { method: 'GET' }, { timeoutMs: TIMEOUT_MS.st, what });
@@ -1370,7 +1512,7 @@ async function collectTtImages(entries, skipped) {
             if (!safe) continue;
             const bytes = await fetchImage(ttImageUrl('backgrounds', rel), `取背景图 ${rel}`);
             if (!bytes) continue;
-            entries.push({ name: `backgrounds/${safe}`, data: bytes });
+            yield { name: `backgrounds/${safe}`, data: bytes };
             bgOk += 1;
         }
     } catch (err) {
@@ -1392,7 +1534,7 @@ async function collectTtImages(entries, skipped) {
             if (!safe) continue;
             const bytes = await fetchImage(ttImageUrl('User Avatars', raw), `取用户头像 ${safe}`);
             if (!bytes) continue;
-            entries.push({ name: `User Avatars/${safe}`, data: bytes });
+            yield { name: `User Avatars/${safe}`, data: bytes };
             avatarOk += 1;
         }
     } catch (err) {
@@ -1909,6 +2051,65 @@ function zipDosStamp(date) {
     };
 }
 
+/** 局部文件头：解压器实际是顺着中央目录找过来的，但头部字段必须自洽 */
+function zipLocalHeader(nameBytes, sum, size, stamp) {
+    const local = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(local.buffer);
+    lv.setUint32(0, ZIP_SIG_LOCAL, true);
+    lv.setUint16(4, ZIP_WRITER_VERSION, true);
+    lv.setUint16(6, ZIP_FLAG_UTF8, true);
+    lv.setUint16(8, 0, true);                 // method 0 = store
+    lv.setUint16(10, stamp.time, true);
+    lv.setUint16(12, stamp.date, true);
+    lv.setUint32(14, sum, true);
+    lv.setUint32(18, size, true);             // 未压缩大小
+    lv.setUint32(22, size, true);             // 压缩后大小（store 时两者相同）
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);                // 扩展区长度
+    local.set(nameBytes, 30);
+    return local;
+}
+
+/** 中央目录项；offset 是这个条目局部头的起始位置 */
+function zipCentralHeader(nameBytes, sum, size, offset, stamp) {
+    const central = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(central.buffer);
+    cv.setUint32(0, ZIP_SIG_CENTRAL, true);
+    cv.setUint16(4, ZIP_WRITER_VERSION, true);   // version made by（高字节 0 = MS-DOS/FAT）
+    cv.setUint16(6, ZIP_WRITER_VERSION, true);   // version needed
+    cv.setUint16(8, ZIP_FLAG_UTF8, true);
+    cv.setUint16(10, 0, true);                   // method
+    cv.setUint16(12, stamp.time, true);
+    cv.setUint16(14, stamp.date, true);
+    cv.setUint32(16, sum, true);
+    cv.setUint32(20, size, true);
+    cv.setUint32(24, size, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);                   // 扩展区长度
+    cv.setUint16(32, 0, true);                   // 注释长度
+    cv.setUint16(34, 0, true);                   // 起始磁盘号
+    cv.setUint16(36, 0, true);                   // 内部属性
+    cv.setUint32(38, 0, true);                   // 外部属性（没建目录项，权限位无所谓）
+    cv.setUint32(42, offset, true);              // 对应局部头的偏移
+    central.set(nameBytes, 46);
+    return central;
+}
+
+/** 中央目录结尾记录 */
+function zipEndRecord(count, centralSize, centralOffset) {
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, ZIP_SIG_EOCD, true);
+    ev.setUint16(4, 0, true);                        // 本磁盘号
+    ev.setUint16(6, 0, true);                        // 中央目录起始磁盘号
+    ev.setUint16(8, count, true);                    // 本磁盘上的条目数
+    ev.setUint16(10, count, true);                   // 总条目数
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, centralOffset, true);           // 中央目录起始偏移
+    ev.setUint16(20, 0, true);                       // 注释长度
+    return eocd;
+}
+
 /**
  * 打一个 store-only 的 zip。
  *
@@ -1938,63 +2139,112 @@ function buildZip(entries, { date } = {}) {
         }
         const sum = crc32(data);
 
-        // 局部头 + 内容：解压器实际是顺着中央目录找过来的，但头部字段必须自洽
-        const local = new Uint8Array(30 + nameBytes.length);
-        const lv = new DataView(local.buffer);
-        lv.setUint32(0, ZIP_SIG_LOCAL, true);
-        lv.setUint16(4, ZIP_WRITER_VERSION, true);
-        lv.setUint16(6, ZIP_FLAG_UTF8, true);
-        lv.setUint16(8, 0, true);                 // method 0 = store
-        lv.setUint16(10, stamp.time, true);
-        lv.setUint16(12, stamp.date, true);
-        lv.setUint32(14, sum, true);
-        lv.setUint32(18, data.length, true);      // 未压缩大小
-        lv.setUint32(22, data.length, true);      // 压缩后大小（store 时两者相同）
-        lv.setUint16(26, nameBytes.length, true);
-        lv.setUint16(28, 0, true);                // 扩展区长度
-        local.set(nameBytes, 30);
-
-        const central = new Uint8Array(46 + nameBytes.length);
-        const cv = new DataView(central.buffer);
-        cv.setUint32(0, ZIP_SIG_CENTRAL, true);
-        cv.setUint16(4, ZIP_WRITER_VERSION, true);   // version made by（高字节 0 = MS-DOS/FAT）
-        cv.setUint16(6, ZIP_WRITER_VERSION, true);   // version needed
-        cv.setUint16(8, ZIP_FLAG_UTF8, true);
-        cv.setUint16(10, 0, true);                   // method
-        cv.setUint16(12, stamp.time, true);
-        cv.setUint16(14, stamp.date, true);
-        cv.setUint32(16, sum, true);
-        cv.setUint32(20, data.length, true);
-        cv.setUint32(24, data.length, true);
-        cv.setUint16(28, nameBytes.length, true);
-        cv.setUint16(30, 0, true);                   // 扩展区长度
-        cv.setUint16(32, 0, true);                   // 注释长度
-        cv.setUint16(34, 0, true);                   // 起始磁盘号
-        cv.setUint16(36, 0, true);                   // 内部属性
-        cv.setUint32(38, 0, true);                   // 外部属性（没建目录项，权限位无所谓）
-        cv.setUint32(42, offset, true);              // 对应局部头的偏移
-        central.set(nameBytes, 46);
-
+        const local = zipLocalHeader(nameBytes, sum, data.length, stamp);
+        centralParts.push(zipCentralHeader(nameBytes, sum, data.length, offset, stamp));
         localParts.push(local, data);
-        centralParts.push(central);
         offset += local.length + data.length;
     }
 
     const centralSize = centralParts.reduce((n, part) => n + part.length, 0);
 
-    const eocd = new Uint8Array(22);
-    const ev = new DataView(eocd.buffer);
-    ev.setUint32(0, ZIP_SIG_EOCD, true);
-    ev.setUint16(4, 0, true);                        // 本磁盘号
-    ev.setUint16(6, 0, true);                        // 中央目录起始磁盘号
-    ev.setUint16(8, list.length, true);              // 本磁盘上的条目数
-    ev.setUint16(10, list.length, true);             // 总条目数
-    ev.setUint32(12, centralSize, true);
-    ev.setUint32(16, offset, true);                  // 中央目录起始偏移
-    ev.setUint16(20, 0, true);                       // 注释长度
-
     // 内容直接进 Blob（浏览器里按引用算，不会先拷进 JS 堆），只有头是现拼的
-    return new Blob([...localParts, ...centralParts, eocd], { type: 'application/zip' });
+    return new Blob([...localParts, ...centralParts, zipEndRecord(list.length, centralSize, offset)], {
+        type: 'application/zip',
+    });
+}
+
+/**
+ * 分片缓冲：攒够 partSize 就交出去（上传），内存里永远只有一片。
+ *
+ * 为什么不直接 `new Blob([...所有条目])`：Blob 构造在 iOS WebKit 上会把内容拷进
+ * Blob 自己的存储，几百 MB 的包等于在"条目数组"之外再拷一份，峰值直接超限。
+ * 这里每次只构造 4 MB 的 Blob，发完立刻丢掉。
+ */
+class ZipPartWriter {
+    constructor({ partSize = UPLOAD_PART_SIZE, onPart } = {}) {
+        this.partSize = partSize;
+        this.onPart = onPart;
+        this.pending = [];
+        this.pendingBytes = 0;
+        this.offset = 0;       // 已经写进 zip 的总字节数（= 下一个字节的偏移）
+    }
+
+    async write(bytes) {
+        let at = 0;
+        while (at < bytes.length) {
+            const take = Math.min(this.partSize - this.pendingBytes, bytes.length - at);
+            // subarray 是视图，不拷贝；底层 buffer 是当前条目，反正它本来就在内存里
+            this.pending.push(bytes.subarray(at, at + take));
+            this.pendingBytes += take;
+            this.offset += take;
+            at += take;
+            if (this.pendingBytes >= this.partSize) await this.flush();
+        }
+    }
+
+    async flush() {
+        if (!this.pendingBytes) return;
+        const blob = new Blob(this.pending, { type: 'application/octet-stream' });
+        this.pending = [];
+        this.pendingBytes = 0;
+        // 先清空再 await：上传期间这块内存已经交给 Blob 和网络层了
+        await this.onPart(blob);
+    }
+}
+
+/**
+ * 边收集边拼 zip：每攒够一片就交出去，不在内存里留整包。
+ *
+ * zip 的结构决定了它只能顺序写：所有局部头+数据在前，中央目录在最后。
+ * 中央目录每项只有几十字节，留在内存里完全没问题。
+ *
+ * @param {object} o
+ * @param {(blob: Blob) => Promise<void>} o.onPart 每片好了一个（顺序调用，必须 await 完再发下一片）
+ * @param {(info: {count: number, bytes: number}) => void} [o.onEntry] 每拼完一个条目回调，给进度用
+ * @param {Date} [o.date] 时间戳，测试里固定住用
+ * @param {number} [o.partSize] 一片多大，默认 UPLOAD_PART_SIZE（测试里调小才能验多片拼回来）
+ * @returns {Promise<{size: number, entries: number, skipped: string[]}>}
+ */
+async function streamTtZip({ onPart, onEntry, date, partSize } = {}) {
+    const stamp = zipDosStamp(date);
+    const centralParts = [];
+    const skipped = [];
+    const writer = new ZipPartWriter({ partSize, onPart });
+    let count = 0;
+
+    for await (const item of iterateTtEntries(skipped)) {
+        const nameBytes = zipTextEncoder.encode(String(item.name));
+        const data = zipBytes(item.data);
+        if (data.length > ZIP_MAX_BYTES || writer.offset + data.length > ZIP_MAX_BYTES) {
+            throw new Error(`条目 ${item.name} 太大，超过 4GB 上限，需要 Zip64 —— 不做了`);
+        }
+        if (count >= ZIP_MAX_ENTRIES) {
+            throw new Error(`条目太多，超过 zip 的 65535 上限，需要 Zip64 —— 不做了`);
+        }
+
+        const sum = crc32(data);
+        const localOffset = writer.offset;
+        await writer.write(zipLocalHeader(nameBytes, sum, data.length, stamp));
+        await writer.write(data);
+        centralParts.push(zipCentralHeader(nameBytes, sum, data.length, localOffset, stamp));
+
+        count += 1;
+        if (onEntry) onEntry({ count, bytes: writer.offset });
+    }
+
+    if (!count) throw new Error('没能从酒馆读到任何数据，先看面板日志');
+
+    // 中央目录和结尾记录也走同一条缓冲/上传路径，最后 flush 掉不满一片的尾巴
+    const centralOffset = writer.offset;
+    let centralSize = 0;
+    for (const part of centralParts) {
+        await writer.write(part);
+        centralSize += part.length;
+    }
+    await writer.write(zipEndRecord(count, centralSize, centralOffset));
+    await writer.flush();
+
+    return { size: writer.offset, entries: count, skipped };
 }
 
 // ==== ZIP-WRITER-END ====
@@ -2773,14 +3023,79 @@ function stamp() {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
+/**
+ * TT 大包的边打包边上传。
+ *
+ * 流程：开会话 → 逐条读酒馆、拼进 zip、每 4 MB 发一片 → finish。
+ * 任何一个环节失败都主动 abort，别把半截临时文件留在中转上。
+ */
+async function pushTtStreaming(key, fileName) {
+    log(`边打包边上传：每 ${fmtBytes(UPLOAD_PART_SIZE)} 追加一片`);
+    const uploadId = await relayUploadBegin(key);
+
+    STATE.upload = { label: fileName, uploaded: 0, packed: 0, entries: 0 };
+    renderStatus();
+
+    let seq = 0;
+    try {
+        const result = await streamTtZip({
+            onPart: async (blob) => {
+                await relayUploadPart(uploadId, seq, blob);
+                seq += 1;
+                STATE.upload.uploaded += blob.size;
+                renderStatus();
+            },
+            onEntry: ({ count, bytes }) => {
+                STATE.upload.entries = count;
+                STATE.upload.packed = bytes;
+            },
+        });
+
+        log(`打包完成：${result.entries} 个条目，${fmtBytes(result.size)}，等中转落盘`);
+        if (result.skipped.length) {
+            log(`有 ${result.skipped.length} 项没进包：`);
+            for (const line of result.skipped) log(`  · ${line}`);
+        }
+
+        STATE.step = '等中转落盘';
+        renderStatus();
+        const fin = await relayUploadFinish(uploadId, result.size);
+        if (fin.size !== result.size) {
+            throw new Error(`中转落盘的大小对不上（期望 ${result.size}，实际 ${fin.size}）`);
+        }
+        return fin;
+    } catch (err) {
+        await relayUploadAbort(uploadId);
+        throw err;
+    } finally {
+        STATE.upload = null;
+        renderStatus();
+    }
+}
+
 async function pushToRelay() {
     const s = requireConfig();
     notify('info', '正在打包并上传…');
 
-    const blob = await buildLocalBackup();
     const fileName = `${stamp()}.zip`;
+    const key = snapshotKeyOf(s.deviceId, fileName);
 
-    const put = await relayPut(snapshotKeyOf(s.deviceId, fileName), blob, 'application/zip');
+    let put = null;
+    if (isTauriTavern()) {
+        // 只有 TT 需要逐类读、自己拼包，所以也只有它能边读边发。原版 ST 的备份接口
+        // 由后端打包，拿回来的本身就是一整包，没有可流式的中间数据。
+        const features = await relayFeatures();
+        if (features.chunkedUpload) {
+            put = await pushTtStreaming(key, fileName);
+        } else {
+            log('中转是老版本（不支持分片上传），退回整包 PUT —— 大包在手机上可能内存不足');
+        }
+    }
+
+    if (!put) {
+        const blob = await buildLocalBackup();
+        put = await relayPut(key, blob, 'application/zip');
+    }
 
     const latest = {
         device: s.deviceId,

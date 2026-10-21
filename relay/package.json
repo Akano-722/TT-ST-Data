@@ -1,6 +1,6 @@
 {
   "name": "st-sync-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "通用文件桶中转服务：命名空间隔离 + Bearer 鉴权，用于 SillyTavern 双端数据同步",
   "main": "server.js",

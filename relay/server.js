@@ -7,6 +7,7 @@ const express = require('express');
 
 const { Auth, timingSafeEqualStr } = require('./lib/auth');
 const { Storage } = require('./lib/storage');
+const { UploadSessions } = require('./lib/uploads');
 const { HttpError, badRequest, assertSegment, splitKey, NAMESPACE_RE } = require('./lib/paths');
 
 const VERSION = require('./package.json').version;
@@ -20,6 +21,7 @@ const BOOTSTRAP_TOKEN = (process.env.BOOTSTRAP_TOKEN || '').trim();
 
 const auth = new Auth(path.join(DATA_DIR, 'auth.json'));
 const storage = new Storage(DATA_DIR);
+const uploads = new UploadSessions(storage);
 
 // ---------------------------------------------------------------- 中间件
 
@@ -73,17 +75,29 @@ function requireAdmin(req, res, next) {
  * 命名空间隔离的核心：URL 里的 :ns 必须等于令牌绑定的命名空间。
  * 这样 A 的令牌在服务端根本走不到 B 的目录，不依赖上层逻辑写对。
  */
-function requireOwnNamespace(req, res, next) {
+function requireOwnNamespaceOnly(req, res, next) {
     try {
         assertSegment(req.params.ns, 'namespace');
         if (req.params.ns !== req.namespace) {
             return res.status(403).json({ error: '令牌无权访问该命名空间' });
         }
-        assertSegment(req.params.bucket, 'bucket');
         return next();
     } catch (err) {
         return next(err);
     }
+}
+
+/** 文件路由用：命名空间 + 桶都要校验。分片上传的 part/finish 没有 bucket，只走上面那条。 */
+function requireOwnNamespace(req, res, next) {
+    requireOwnNamespaceOnly(req, res, (err) => {
+        if (err) return next(err);
+        try {
+            assertSegment(req.params.bucket, 'bucket');
+            return next();
+        } catch (e) {
+            return next(e);
+        }
+    });
 }
 
 /** 从通配符里取出 key，并逐个片段校验 */
@@ -189,6 +203,10 @@ app.get('/', (req, res) => {
             get: 'GET    /v1/ns/:ns/:bucket/*key',
             list: 'GET    /v1/ns/:ns/:bucket              (列出文件与用量)',
             remove: 'DELETE /v1/ns/:ns/:bucket/*key',
+            uploadBegin: 'POST   /v1/uploads/:ns/:bucket       (body {key}，开一个分片上传会话)',
+            uploadPart: 'PUT    /v1/uploads/:ns/:uploadId/part/:seq (按 seq 顺序追加)',
+            uploadFinish: 'POST   /v1/uploads/:ns/:uploadId/finish (body {expectedSize})',
+            uploadAbort: 'DELETE /v1/uploads/:ns/:uploadId',
             adminUI: 'GET    /admin                       (管理后台页面，页面本身不需要令牌)',
             adminNamespaces: 'GET    /admin/namespaces            (需管理员令牌)',
             adminNamespace: 'POST   /admin/namespace             (需管理员令牌)',
@@ -206,7 +224,77 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/v1/meta', authenticate, (req, res) => {
-    res.json({ ok: true, namespace: req.namespace });
+    res.json({
+        ok: true,
+        namespace: req.namespace,
+        // 扩展靠这个决定要不要走"边打包边分片上传"。旧中转没有 features 字段，
+        // 新扩展会自动退回整包 PUT。
+        features: { chunkedUpload: true },
+    });
+});
+
+// ---- 分片追加上传 ----
+//
+// 这条路是给手机端大包准备的：客户端边收集边拼 zip，每 4 MB 发一片。
+// 服务端只做顺序追加，finish 时 rename 到最终 key；数据格式和旧 PUT 完全一样。
+
+app.post('/v1/uploads/:ns/:bucket', authenticate, requireOwnNamespace, jsonBody, async (req, res, next) => {
+    try {
+        const rawKey = String((req.body && req.body.key) || '').trim();
+        const keyParts = splitKey(rawKey);
+        if (!keyParts.length) throw badRequest('缺少文件路径');
+        keyParts.forEach((part) => assertSegment(part, 'key'));
+
+        const result = await uploads.begin({
+            namespace: req.namespace,
+            bucket: req.params.bucket,
+            key: keyParts.join('/'),
+        });
+        res.status(201).json({ ok: true, uploadId: result.uploadId, key: result.key });
+    } catch (err) {
+        next(err);
+    }
+});
+
+app.put('/v1/uploads/:ns/:uploadId/part/:seq', authenticate, requireOwnNamespaceOnly, async (req, res, next) => {
+    try {
+        const seq = Number(req.params.seq);
+        if (!Number.isInteger(seq) || seq < 0) throw badRequest('分片序号必须是非负整数');
+
+        const session = uploads.get(req.params.uploadId, req.namespace);
+        if (!session) return res.status(404).json({ error: '上传会话不存在或已结束' });
+
+        const result = await uploads.append(session, seq, req);
+        return res.json(result);
+    } catch (err) {
+        return next(err);
+    }
+});
+
+app.post('/v1/uploads/:ns/:uploadId/finish', authenticate, requireOwnNamespaceOnly, jsonBody, async (req, res, next) => {
+    try {
+        const session = uploads.get(req.params.uploadId, req.namespace);
+        if (!session) return res.status(404).json({ error: '上传会话不存在或已结束' });
+
+        const rawSize = req.body && req.body.expectedSize;
+        const expectedSize = rawSize === undefined || rawSize === null ? undefined : Number(rawSize);
+        const result = await uploads.finish(session, expectedSize);
+        return res.json(result);
+    } catch (err) {
+        return next(err);
+    }
+});
+
+app.delete('/v1/uploads/:ns/:uploadId', authenticate, requireOwnNamespaceOnly, async (req, res, next) => {
+    try {
+        const session = uploads.get(req.params.uploadId, req.namespace);
+        if (!session) return res.json({ ok: true, aborted: false });
+
+        await uploads.abort(session);
+        return res.json({ ok: true, aborted: true });
+    } catch (err) {
+        return next(err);
+    }
 });
 
 // ---- 文件读写 ----
@@ -424,6 +512,7 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
 
 async function bootstrap() {
     await storage.init();
+    await uploads.init();
     await auth.load();
 
     if (!ADMIN_TOKEN) {
@@ -459,4 +548,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, auth, storage, bootstrap };
+module.exports = { app, auth, storage, uploads, bootstrap };

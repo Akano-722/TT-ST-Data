@@ -111,6 +111,28 @@ function rawRequest(method, rawPath, { token, body } = {}) {
     });
 }
 
+/**
+ * 发一片"说到 100 字节、实际只给 10 字节就掐断"的分片。
+ * 模拟手机上上传到一半断网 —— 服务端应该把半片截掉，而不是把整个会话作废。
+ */
+function abortPartRequest(uploadId, token) {
+    return new Promise((resolve) => {
+        const req = http.request(
+            {
+                host: '127.0.0.1',
+                port: PORT,
+                method: 'PUT',
+                path: `/v1/uploads/A/${uploadId}/part/1`,
+                headers: { Authorization: `Bearer ${token}`, 'Content-Length': 100 },
+            },
+            (res) => { res.resume(); resolve(); },
+        );
+        req.on('error', () => resolve());
+        req.write(Buffer.from('BBBBBBBBBB')); // 只发 10 个，剩下 90 个永远不来
+        setTimeout(() => { req.destroy(); resolve(); }, 100);
+    });
+}
+
 async function main() {
     await fsp.rm(DATA_DIR, { recursive: true, force: true });
 
@@ -260,6 +282,200 @@ async function main() {
         assertEqual(list.count, 0, '删除后文件数');
     });
 
+    console.log('\n分片追加上传:');
+    const UP_BUCKET = 'upload-test';
+    const upKey = 'devices/test/snapshots/parted.zip';
+    const upPartA = Buffer.from('PK\x03\x04 hello ');
+    const upPartB = Buffer.from('world 你好 ');
+    const upAll = Buffer.concat([upPartA, upPartB]);
+    let uploadId = '';
+
+    await check('meta 声明支持 chunkedUpload', async () => {
+        const res = await fetch(`${BASE}/v1/meta`, { headers: authHeaders(BOOTSTRAP_TOKEN) });
+        const body = await res.json();
+        assertEqual(res.status, 200, '状态码');
+        assertEqual(body.features && body.features.chunkedUpload, true, 'features.chunkedUpload');
+    });
+
+    await check('begin 返回 32 位十六进制 uploadId', async () => {
+        const res = await fetch(`${BASE}/v1/uploads/A/${UP_BUCKET}`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: upKey }),
+        });
+        const body = await res.json();
+        assertEqual(res.status, 201, '状态码');
+        assert(/^[0-9a-f]{32}$/.test(body.uploadId), `uploadId 形状不对: ${body.uploadId}`);
+        uploadId = body.uploadId;
+    });
+
+    await check('part 0 / 1 按顺序追加，size 递增', async () => {
+        const r0 = await fetch(`${BASE}/v1/uploads/A/${uploadId}/part/0`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: upPartA,
+        });
+        const b0 = await r0.json();
+        assertEqual(r0.status, 200, '第一片状态码');
+        assertEqual(b0.size, upPartA.length, '第一片后的 size');
+
+        const r1 = await fetch(`${BASE}/v1/uploads/A/${uploadId}/part/1`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: upPartB,
+        });
+        const b1 = await r1.json();
+        assertEqual(r1.status, 200, '第二片状态码');
+        assertEqual(b1.size, upAll.length, '第二片后的 size');
+    });
+
+    await check('最后一片超时重试是幂等的，不会重复追加', async () => {
+        // 真实场景：part 1 响应丢了，客户端用同一个 seq 重发。此时服务端已经把它
+        // 追加进去了，nextSeq 是 2；重发 seq=1 必须回 duplicate，而不是再写一遍。
+        const res = await fetch(`${BASE}/v1/uploads/A/${uploadId}/part/1`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: upPartB,
+        });
+        const body = await res.json();
+        assertEqual(res.status, 200, '状态码');
+        assertEqual(body.duplicate, true, '应标记为重复分片');
+        assertEqual(body.size, upAll.length, 'size 不该增长');
+    });
+
+    await check('跳号分片返回 409', async () => {
+        const res = await fetch(`${BASE}/v1/uploads/A/${uploadId}/part/5`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: Buffer.from('x'),
+        });
+        assertEqual(res.status, 409, '状态码');
+    });
+
+    await check('半片断网后重发同一 seq：会话还在，也不残留半截字节', async () => {
+        // 真实场景：手机上 part 1 传到一半断开。老实现会把整个会话丢掉，用户得
+        // 重新把几百 MB 读一遍；新实现截回上一片结尾，重试同一 seq 就能接着走。
+        const begin = await fetch(`${BASE}/v1/uploads/A/${UP_BUCKET}`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'devices/test/snapshots/half-part.zip' }),
+        });
+        const { uploadId: halfId } = await begin.json();
+
+        const first = Buffer.from('AAAA');
+        const r0 = await fetch(`${BASE}/v1/uploads/A/${halfId}/part/0`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: first,
+        });
+        assertEqual(r0.status, 200, '第一片状态码');
+
+        await abortPartRequest(halfId, BOOTSTRAP_TOKEN);
+        // 给服务端一点时间看到连接断开（重试请求也会排在同一会话的锁后面，其实不必等）
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        const second = Buffer.from('BBBB');
+        const r1 = await fetch(`${BASE}/v1/uploads/A/${halfId}/part/1`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: second,
+        });
+        const b1 = await r1.json();
+        assertEqual(r1.status, 200, '重试同一 seq 的状态码');
+        assertEqual(b1.size, first.length + second.length, '重试后的 size 只算干净的两片');
+
+        const fin = await fetch(`${BASE}/v1/uploads/A/${halfId}/finish`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expectedSize: first.length + second.length }),
+        });
+        assertEqual(fin.status, 200, 'finish 状态码');
+
+        const got = await fetch(`${BASE}/v1/ns/A/${UP_BUCKET}/devices/test/snapshots/half-part.zip`, {
+            headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        assertEqual(got.status, 200, '下载状态码');
+        const bytes = Buffer.from(await got.arrayBuffer());
+        assert(bytes.equals(Buffer.concat([first, second])), `半片残留进了最终文件：${JSON.stringify(bytes.toString('utf8'))}`);
+    });
+
+    await check('finish 校验大小、算 sha256 并原子落盘', async () => {
+        const expected = require('crypto').createHash('sha256').update(upAll).digest('hex');
+        const res = await fetch(`${BASE}/v1/uploads/A/${uploadId}/finish`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expectedSize: upAll.length }),
+        });
+        const body = await res.json();
+        assertEqual(res.status, 200, '状态码');
+        assertEqual(body.size, upAll.length, '大小');
+        assertEqual(body.sha256, expected, 'sha256');
+
+        const got = await fetch(`${BASE}/v1/ns/A/${UP_BUCKET}/${upKey}`, {
+            headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        assertEqual(got.status, 200, '下载状态码');
+        assert(Buffer.from(await got.arrayBuffer()).equals(upAll), '落盘内容与分片拼接不一致');
+    });
+
+    await check('finish 后会话失效（part 返回 404）', async () => {
+        const res = await fetch(`${BASE}/v1/uploads/A/${uploadId}/part/2`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: Buffer.from('late'),
+        });
+        assertEqual(res.status, 404, '状态码');
+    });
+
+    await check('finish 大小不符返回 400，且目标文件不存在', async () => {
+        const res = await fetch(`${BASE}/v1/uploads/A/${UP_BUCKET}`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'devices/test/snapshots/wrong-size.zip' }),
+        });
+        const { uploadId: wrongId } = await res.json();
+        await fetch(`${BASE}/v1/uploads/A/${wrongId}/part/0`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: Buffer.from('abc'),
+        });
+        const fin = await fetch(`${BASE}/v1/uploads/A/${wrongId}/finish`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expectedSize: 999 }),
+        });
+        const finBody = await fin.json();
+        assertEqual(fin.status, 400, '状态码');
+        assert(/对不上/.test(finBody.error || ''), `错误文案: ${finBody.error}`);
+        const got = await fetch(`${BASE}/v1/ns/A/${UP_BUCKET}/devices/test/snapshots/wrong-size.zip`, {
+            headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        assertEqual(got.status, 404, '失败的上传不该落盘');
+        await fetch(`${BASE}/v1/uploads/A/${wrongId}`, {
+            method: 'DELETE', headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+    });
+
+    await check('abort 后会话失效、目标不落盘', async () => {
+        const res = await fetch(`${BASE}/v1/uploads/A/${UP_BUCKET}`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'devices/test/snapshots/aborted.zip' }),
+        });
+        const { uploadId: abortId } = await res.json();
+        await fetch(`${BASE}/v1/uploads/A/${abortId}/part/0`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: Buffer.from('partial'),
+        });
+        const abort = await fetch(`${BASE}/v1/uploads/A/${abortId}`, {
+            method: 'DELETE', headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        const abortBody = await abort.json();
+        assertEqual(abort.status, 200, '状态码');
+        assertEqual(abortBody.aborted, true, 'aborted');
+
+        const part = await fetch(`${BASE}/v1/uploads/A/${abortId}/part/1`, {
+            method: 'PUT', headers: authHeaders(BOOTSTRAP_TOKEN), body: Buffer.from('late'),
+        });
+        assertEqual(part.status, 404, 'abort 后的 part 状态码');
+        const got = await fetch(`${BASE}/v1/ns/A/${UP_BUCKET}/devices/test/snapshots/aborted.zip`, {
+            headers: authHeaders(BOOTSTRAP_TOKEN),
+        });
+        assertEqual(got.status, 404, 'abort 的包不该落盘');
+    });
+
+    await check('分片上传也受命名空间隔离', async () => {
+        const noToken = await fetch(`${BASE}/v1/uploads/A/${UP_BUCKET}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'x.zip' }),
+        });
+        assertEqual(noToken.status, 401, '无令牌状态码');
+    });
+
     console.log('\n隔离与安全:');
     await check('管理员创建命名空间 B 并拿到令牌', async () => {
         const res = await fetch(`${BASE}/admin/namespace`, {
@@ -289,6 +505,26 @@ async function main() {
             body: Buffer.from('ok'),
         });
         assertEqual(res.status, 200, '状态码');
+    });
+
+    await check('A 的令牌不能给 B 开分片上传会话', async () => {
+        const denied = await fetch(`${BASE}/v1/uploads/B/tavern`, {
+            method: 'POST',
+            headers: { ...authHeaders(BOOTSTRAP_TOKEN), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'evil.zip' }),
+        });
+        assertEqual(denied.status, 403, '跨命名空间状态码');
+
+        const allowed = await fetch(`${BASE}/v1/uploads/B/tavern`, {
+            method: 'POST',
+            headers: { ...authHeaders(globalThis.tokenB), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: 'own.zip' }),
+        });
+        assertEqual(allowed.status, 201, '自己的命名空间状态码');
+        const { uploadId } = await allowed.json();
+        await fetch(`${BASE}/v1/uploads/B/${uploadId}`, {
+            method: 'DELETE', headers: authHeaders(globalThis.tokenB),
+        });
     });
 
     await check('字面量 .. 的路径穿越被服务端拒绝', async () => {

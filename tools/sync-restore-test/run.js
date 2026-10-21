@@ -63,6 +63,8 @@ const EXPORTS = [
     'fmtBytes', 'uploadTimeoutFor',
     // 上传绕行：拼 zip + 逐类读
     'buildZip', 'crc32', 'ZipReader', 'collectTtEntries', 'buildTtBackup', 'TT_API', 'TT_NO_READ_API',
+    // 边打包边上传
+    'streamTtZip', 'pushToRelay', 'relayFeatures', 'UPLOAD_PART_SIZE',
     // 云侧的分类，用来验"上传拼出来的目录名云侧认不认"
     'classifyRestoreEntry',
 ];
@@ -1845,6 +1847,212 @@ async function testClassicStaysOnBackupApi(bad_) {
 }
 
 /**
+ * 边拼边发和整包拼出来的 zip 必须**逐字节一致**。
+ *
+ * 时间戳固定住，这样两份包的局部头/中央目录完全相同；差一个字节都说明
+ * 分片路径漏写或重复写了什么 —— 那种包用户是解不开的。
+ */
+async function testStreamTtZip(bad_) {
+    console.log('\n── 边拼边发：streamTtZip 与整包 buildZip 一致 ──');
+    const { impl } = makeTtReadFetch();
+    const { api } = loadExtension({ fetchImpl: impl, tav: true, seed: configSeed('http://relay.test') });
+    const date = new Date(2026, 9, 21, 12, 0, 0);
+
+    const { entries, skipped } = await api.collectTtEntries();
+    const whole = new Uint8Array(await api.buildZip(entries, { date }).arrayBuffer());
+
+    const parts = [];
+    const progress = [];
+    const result = await api.streamTtZip({
+        date,
+        partSize: 1000, // 调小，保证真的切成很多片
+        onPart: async (blob) => { parts.push(new Uint8Array(await blob.arrayBuffer())); },
+        onEntry: (info) => progress.push(info),
+    });
+
+    const joined = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+    let at = 0;
+    for (const part of parts) {
+        joined.set(part, at);
+        at += part.length;
+    }
+
+    if (parts.length < 2) {
+        bad('没有切成多片', `只有 ${parts.length} 片，分片路径等于没测到`);
+    } else {
+        const oversize = parts.filter((part) => part.length > 1000).length;
+        if (oversize) bad('有分片超过缓冲区大小', `${oversize} 片大于 1000 字节，内存就不再是有界的了`);
+        else ok(`切成 ${parts.length} 片，每片都不超过 1000 字节`);
+    }
+
+    if (!Buffer.from(joined).equals(Buffer.from(whole))) {
+        bad('分片拼回来的包和整包不一致', `分片 ${joined.length} 字节，整包 ${whole.length} 字节`);
+    } else {
+        ok('分片拼回来和整包逐字节一致');
+    }
+
+    if (result.size !== whole.length) bad('返回的 size 不对', `期望 ${whole.length}，实际 ${result.size}`);
+    else ok(`size 与包长一致（${result.size} 字节）`);
+
+    if (result.entries !== entries.length) {
+        bad('条目数对不上', `整包 ${entries.length}，分片 ${result.entries}`);
+    } else if (progress.length !== entries.length || progress[progress.length - 1].count !== entries.length) {
+        bad('进度回调不完整', JSON.stringify(progress.slice(-3)));
+    } else {
+        ok(`${result.entries} 个条目都报了进度（状态栏能看出卡在哪）`);
+    }
+
+    if (result.skipped.length !== skipped.length) {
+        bad('跳过的项没传出来', `整包 ${skipped.length} 条，分片 ${result.skipped.length} 条`);
+    } else {
+        ok(`跳过的 ${skipped.length} 项原样带出来（日志还能照常说明缺口）`);
+    }
+}
+
+/** 造一个假的"支持分片"中转，同时能接住 TT 的读接口 */
+function makeChunkRelayFetch({ chunked = true } = {}) {
+    const { impl: ttImpl } = makeTtReadFetch();
+    const uploaded = [];
+    const deletes = [];
+    const snapshotPuts = [];
+    let finishBody = null;
+    let latestBody = null;
+    let beginCalls = 0;
+
+    const impl = async (url, opts = {}) => {
+        const method = opts.method || 'GET';
+
+        if (url === 'http://relay.test/v1/meta') {
+            if (!chunked) return json({ error: 'Not found' }, 404);
+            return json({ ok: true, features: { chunkedUpload: true } });
+        }
+        if (method === 'POST' && url === 'http://relay.test/v1/uploads/A/tavern') {
+            beginCalls += 1;
+            return json({ ok: true, uploadId: 'u1', key: 'devices/local/snapshots/x.zip' }, 201);
+        }
+        const part = /\/v1\/uploads\/A\/u1\/part\/(\d+)$/.exec(url);
+        if (part) {
+            const bytes = new Uint8Array(await opts.body.arrayBuffer());
+            const seq = Number(part[1]);
+            uploaded.push({ seq, bytes });
+            const size = uploaded.reduce((n, item) => n + item.bytes.length, 0);
+            return json({ ok: true, seq, size });
+        }
+        if (method === 'POST' && /\/v1\/uploads\/A\/u1\/finish$/.test(url)) {
+            finishBody = JSON.parse(String(opts.body));
+            return json({
+                ok: true,
+                key: 'devices/local/snapshots/x.zip',
+                size: uploaded.reduce((n, item) => n + item.bytes.length, 0),
+                mtime: 1,
+                sha256: 'deadbeef',
+            });
+        }
+        if (method === 'DELETE' && /\/v1\/uploads\/A\/u1$/.test(url)) {
+            deletes.push(url);
+            return json({ ok: true, aborted: true });
+        }
+        if (method === 'PUT' && url.startsWith('http://relay.test/v1/ns/A/tavern/')) {
+            if (url.endsWith('latest.json')) latestBody = JSON.parse(String(opts.body));
+            else snapshotPuts.push(opts.body);
+            const size = opts.body && typeof opts.body.size === 'number' ? opts.body.size : 1;
+            return json({ ok: true, size });
+        }
+        if (method === 'GET' && url === 'http://relay.test/v1/ns/A/tavern') {
+            return json({ ok: true, files: [] });
+        }
+        if (method === 'DELETE' && url.startsWith('http://relay.test/v1/ns/A/tavern/')) {
+            deletes.push(url);
+            return json({ ok: true });
+        }
+        return ttImpl(url, opts);
+    };
+
+    return { impl, uploaded, deletes, snapshotPuts, get finishBody() { return finishBody; }, get latestBody() { return latestBody; }, get beginCalls() { return beginCalls; } };
+}
+
+/** 支持分片的中转：pushToRelay 必须走边打包边上传，且中转收到的字节拼回来是合法 zip */
+async function testChunkedUpload(bad_) {
+    console.log('\n── 分片追加上传：pushToRelay 走新路 ──');
+    const relay = makeChunkRelayFetch();
+    const { api } = loadExtension({ fetchImpl: relay.impl, tav: true, seed: configSeed('http://relay.test') });
+
+    const latest = await api.pushToRelay();
+
+    if (!relay.beginCalls) bad('没开上传会话', 'meta 说支持分片，却还在走整包');
+    else ok('先开会话，再按片追加');
+
+    if (!relay.uploaded.length) {
+        bad('中转一片都没收到', '');
+        return;
+    }
+    const seqs = relay.uploaded.map((item) => item.seq);
+    const ordered = seqs.every((seq, index) => seq === index);
+    if (!ordered) bad('分片序号不是从 0 连续递增', JSON.stringify(seqs));
+    else ok(`按序发了 ${seqs.length} 片（seq 0..${seqs.length - 1}）`);
+
+    const joined = new Uint8Array(relay.uploaded.reduce((n, item) => n + item.bytes.length, 0));
+    let at = 0;
+    for (const item of relay.uploaded) {
+        joined.set(item.bytes, at);
+        at += item.bytes.length;
+    }
+
+    if (!relay.finishBody) {
+        bad('没调 finish', '');
+    } else if (relay.finishBody.expectedSize !== joined.length) {
+        bad('finish 带的 expectedSize 不对', `期望 ${joined.length}，实际 ${relay.finishBody.expectedSize}`);
+    } else {
+        ok(`finish 带上了准确的 expectedSize（${joined.length} 字节）`);
+    }
+
+    const reader = new api.ZipReader(new Blob([joined]));
+    await reader.parse();
+    const names = reader.entries.map((entry) => entry.name);
+    for (const need of ['characters/Alice.png', 'settings.json']) {
+        if (!names.includes(need)) bad(`拼回来的包里没有 ${need}`, JSON.stringify(names));
+    }
+    if (names.includes('characters/Alice.png') && names.includes('settings.json')) {
+        ok(`中转收到的分片拼回来是合法 zip（${names.length} 个条目）`);
+    }
+
+    if (relay.snapshotPuts.length) bad('整包 PUT 不该出现', `多发出了 ${relay.snapshotPuts.length} 份整包`);
+    else ok('没有同时再发一份整包（手机上那样等于白占内存）');
+
+    if (!relay.latestBody) bad('没写 latest.json', '');
+    else if (relay.latestBody.size !== joined.length || relay.latestBody.sha256 !== 'deadbeef') {
+        bad('latest.json 记的大小/hash 不对', JSON.stringify(relay.latestBody));
+    } else {
+        ok('latest.json 记下了 finish 返回的 size 与 sha256');
+    }
+
+    if (latest.size !== joined.length) bad('pushToRelay 返回的 size 不对', String(latest.size));
+    else ok('返回值与中转落盘的大小一致');
+
+    if (relay.deletes.length) bad('成功路径上不该 abort', JSON.stringify(relay.deletes));
+    else ok('成功后没有误删会话');
+}
+
+/** 老中转（没有 /v1/meta）：必须安静地退回整包 PUT，不能直接失败 */
+async function testChunkedUploadFallback(bad_) {
+    console.log('\n── 分片追加上传：老中转自动退回整包 ──');
+    const relay = makeChunkRelayFetch({ chunked: false });
+    const { api } = loadExtension({ fetchImpl: relay.impl, tav: true, seed: configSeed('http://relay.test') });
+
+    await api.pushToRelay();
+
+    if (relay.beginCalls) bad('老中转上还去开分片会话', '');
+    else ok('没开分片会话');
+
+    if (relay.snapshotPuts.length !== 1) bad('没有退回整包 PUT', `整包请求 ${relay.snapshotPuts.length} 次`);
+    else if (!relay.snapshotPuts[0] || !relay.snapshotPuts[0].size) bad('退回时发的是空包', '');
+    else ok(`退回整包 PUT（${relay.snapshotPuts[0].size} 字节）`);
+
+    if (!relay.latestBody) bad('没写 latest.json', '');
+    else ok('latest.json 照常写入');
+}
+
+/**
  * 拼 zip 这一侧。
  *
  * 圆进圆出只是自证；真正算数的是**换个实现来读**：Python 的 zipfile 是另一套代码，
@@ -1985,6 +2193,9 @@ async function main() {
     await testPresetEntriesClassify(bad);
     await testTtImagesWithoutBytes(bad);
     await testClassicStaysOnBackupApi(bad);
+    await testStreamTtZip(bad);
+    await testChunkedUpload(bad);
+    await testChunkedUploadFallback(bad);
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`通过 ${pass}　失败 ${fail}`);

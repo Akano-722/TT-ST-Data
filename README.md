@@ -90,11 +90,15 @@ git push origin relay
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查，无需令牌 |
-| GET | `/v1/meta` | 返回当前令牌对应的命名空间 |
+| GET | `/v1/meta` | 返回当前令牌对应的命名空间以及 `features.chunkedUpload` |
 | PUT | `/v1/ns/:ns/:bucket/*key` | 上传，返回 `size` / `mtime` / `sha256` |
-| GET | `/v1/ns/:ns/:bucket/*key` | 下载 |
+| GET | `/v1/ns/:ns/:bucket/*key` | 下载（支持单段 `Range`） |
 | GET | `/v1/ns/:ns/:bucket` | 列出文件与总用量 |
 | DELETE | `/v1/ns/:ns/:bucket/*key` | 删除 |
+| POST | `/v1/uploads/:ns/:bucket` | 开分片上传会话，body `{ "key": "..." }` |
+| PUT | `/v1/uploads/:ns/:uploadId/part/:seq` | 按 `seq` 顺序追加一片（4 MB 一片） |
+| POST | `/v1/uploads/:ns/:uploadId/finish` | 校验大小、算 sha256、原子落盘 |
+| DELETE | `/v1/uploads/:ns/:uploadId` | 放弃会话，删临时文件 |
 | GET | `/admin` | **管理后台页面**，见下节 |
 | GET | `/admin/namespaces` | 列出命名空间（管理员令牌） |
 | POST | `/admin/namespace` | 创建命名空间，返回令牌（管理员令牌） |
@@ -105,6 +109,14 @@ git push origin relay
 | POST | `/v1/invite/redeem` | 用邀请码换令牌 |
 
 根路径 `/` 会返回这份清单和当前版本号，方便部署完确认服务活着。
+
+分片上传是**可选能力**，给手机端的大包用：整包几百 MB 时，扩展不再把所有数据拼在内存里，
+而是边读酒馆边拼 zip、每 4 MB 追加一片。临时文件在 `<DATA_DIR>/.uploads/`，进程重启会清空；
+会话闲置 6 小时后自动回收。老版本扩展不调用它，老版本中转也不会被新扩展当成支持
+（新扩展读 `/v1/meta` 的 `features.chunkedUpload`，读不到就退回整包 PUT）。
+
+> **升级顺序：先部署中转，再更新扩展。** 反过来的话，新扩展遇到老中转会走整包 PUT，
+> 手机上仍然可能因为内存不足被打包这一步弄崩。
 
 ## 管理后台
 
